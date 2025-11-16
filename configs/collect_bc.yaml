@@ -14,38 +14,38 @@ future_dt: 0.2         # label spacing
 K: 32                  # route points ahead (ego frame)
 N: 12                   # future waypoints/vels
 
-# Extraction windows
-actor_radius: 60.0
-window_m: 80.0
+# Extraction windows (reduced for speed)
+actor_radius: 40.0      # 40m still covers ~3s at highway speeds
+window_m: 60.0          # 60m map window
 
 # Performance
-no_rendering: false    # show window for debug (set true for throughput)
+no_rendering: false     # Disabled for maximum throughput
 shard_rows: 1000
-max_frames: 1000
+max_frames: 30000
 
 # Agent behavior
 behavior: "normal"     # cautious | normal | aggressive
 wheelbase_m: 2.875
 
-# Episodes and traffic (debug-friendly)
-episodes: 1
-episode_max_frames: 400
+# Episodes and traffic
+episodes: 20
+episode_max_frames: 2000
 npc_count: 40
 
 # Visual debug
-spectator_follow: true
-spectator_mode: "chase"   # "fpv" or "chase"
+spectator_follow: true    # Disabled for maximum throughput
+spectator_mode: "chase"    # "fpv" or "chase"
 
 # BEV configuration
 bev:
-  meters_x: 100.0        # forward/back extent (x)
-  meters_y: 80.0         # left/right extent (y)
-  resolution_m: 0.25     # meters per pixel
+  meters_x: 80.0         # forward/back extent (x) - reduced for speed
+  meters_y: 60.0         # left/right extent (y) - reduced for speed
+  resolution_m: 0.4      # meters per pixel - reduced for speed (~4x fewer pixels)
   lane_width_m: 3.5
   route_corridor_width_m: 6.0
-  centerline_thickness_m: 0.5
-  drivable_thickness_m: 5.0
-  actor_radius_m: 1.0
+  centerline_thickness_m: 0.6    # scaled with resolution
+  drivable_thickness_m: 6.0      # scaled with resolution
+  actor_radius_m: 1.2            # scaled with resolution
 
 # Validation thresholds (sanity checks)
 validation:
@@ -58,7 +58,7 @@ validation:
 
 # Parquet storage
 parquet:
-  compression: gzip     # gzip is robust on Windows; code will auto-fallback if needed
+  compression: snappy   # Much faster than gzip, similar compression ratio
 
 # Storage backend
 storage:

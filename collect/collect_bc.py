@@ -2,12 +2,14 @@ import argparse
 import glob
 import io
 import json
+import logging
 import math
 import os
 import random
 import time
+from collections import deque
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import yaml
 import pyarrow as pa
@@ -16,15 +18,76 @@ import numpy as np
 import zlib
 
 import carla
-from agents.navigation.behavior_agent import BehaviorAgent
 
 from data.schema import Schemas, K_ROUTE_POINTS, N_FUTURE_STEPS, FIXED_DELTA_SECONDS, FUTURE_DELTA_SECONDS, ACTOR_RADIUS_METERS, WINDOW_METERS
 from data.writer import ParquetShardWriter, ParquetDatasetWriter, DuckDBWriter, table_from_pydict
-from carla_utils.route import extract_cmd_and_route, distance_to_goal
+from carla_utils.route import (
+    map_cmd_and_route,
+    distance_to_goal,
+    command_int_to_label,
+    command_int_to_text,
+)
 from carla_utils.actors import collect_nearby_actors, get_ego_state
 from carla_utils.map_vectors import extract_lane_centerline_segments, extract_traffic_light_stoplines
 from carla_utils.futures import FuturesBuffer, future_waypoints_ego
 from carla_utils.bev import rasterize_bev, encode_bev_to_bytes
+
+
+LOG = logging.getLogger("collect_bc")
+
+ROUTE_PRIME_MIN_TICKS = 15  # Reduced for TM autopilot (was 30)
+ROUTE_PRIME_MIN_SPEED_MPS = 1.0  # Reduced for TM autopilot (was 2.0)
+
+
+def configure_logging() -> None:
+    root = logging.getLogger()
+    if not root.handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(message)s",
+        )
+
+
+def ticks_for_seconds(seconds: float, fixed_dt: float) -> int:
+    return max(1, int(math.ceil(seconds / max(1e-6, fixed_dt))))
+
+
+def describe_route_geometry(route_xy: List[tuple]) -> str:
+    if not route_xy:
+        return "no local route available"
+    first = route_xy[0]
+    lookahead_idx = min(len(route_xy) - 1, 7)
+    far = route_xy[lookahead_idx]
+    first_heading = math.degrees(math.atan2(first[1], first[0]))
+    far_heading = math.degrees(math.atan2(far[1], far[0]))
+    delta = ((far_heading - first_heading + 180.0) % 360.0) - 180.0
+    far_dist = math.hypot(far[0], far[1])
+    if abs(delta) < 15.0:
+        curvature_desc = "continue straight"
+    elif delta > 0:
+        curvature_desc = "curving left"
+    else:
+        curvature_desc = "curving right"
+    return (
+        f"{curvature_desc} (Δheading={delta:+.1f}°, first={first_heading:+.1f}°, "
+        f"lookahead={far_heading:+.1f}°, lookahead_dist={far_dist:.1f}m)"
+    )
+
+
+def check_route_sanity(
+    route_xy: List[tuple],
+    frame_id: int,
+    cmd_int: int,
+    plan_source: str,
+) -> None:
+    """Light sanity check: just warn if route is completely missing (non-fatal)."""
+    if not route_xy:
+        LOG.warning(
+            "Frame %d: no route points available (cmd=%s, source=%s)",
+            frame_id,
+            command_int_to_label(cmd_int),
+            plan_source,
+        )
 
 
 def set_sync(world: carla.World, tm: carla.TrafficManager, enable: bool, fixed_delta: float, no_rendering: bool) -> None:
@@ -45,13 +108,28 @@ def pick_far_spawn_pair(world: carla.World):
     return a, b
 
 
-def spawn_model3(world: carla.World, transform: carla.Transform) -> carla.Vehicle:
+def spawn_model3(world: carla.World, transform: carla.Transform, max_retries: int = 10) -> carla.Vehicle:
     bp = world.get_blueprint_library().find("vehicle.tesla.model3")
     bp.set_attribute("role_name", "hero")
+    
+    # Try the requested transform first
     v = world.try_spawn_actor(bp, transform)
-    if not v:
-        raise RuntimeError("Failed to spawn ego vehicle")
-    return v
+    if v:
+        return v
+    
+    # If that fails, try alternative spawn points
+    spawn_points = list(world.get_map().get_spawn_points())
+    random.shuffle(spawn_points)
+    
+    for i, sp in enumerate(spawn_points[:max_retries]):
+        v = world.try_spawn_actor(bp, sp)
+        if v:
+            LOG.info("Spawned ego at alternative spawn point (attempt %d)", i + 2)
+            return v
+        # Give the world a tick to settle between attempts
+        world.tick()
+    
+    raise RuntimeError(f"Failed to spawn ego vehicle after {max_retries + 1} attempts")
 
 
 def make_run_dir(base_out: str) -> str:
@@ -75,6 +153,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=os.path.join("configs", "collect_bc.yaml"))
     args = ap.parse_args()
+
+    configure_logging()
+    LOG.info("Starting BC collection with config file %s", args.config)
 
     cfg = load_config(args.config)
     host = cfg.get("host", "127.0.0.1")
@@ -163,7 +244,6 @@ def main():
         bev_w = ParquetDatasetWriter(os.path.join(run_dir), "bev_frames", Schemas.BEV_FRAMES, compression=pq_compression)
 
     ego = None
-    agent = None
     goal_tf = None
     goal_start_dist_m = 0.0
     futures = FuturesBuffer(capacity=max(64, int(math.ceil(N * future_dt / fixed_dt)) * 3))
@@ -224,67 +304,106 @@ def main():
             if ego is not None:
                 try:
                     ego.destroy()
+                    # Give the world time to process the destruction
+                    for _ in range(3):
+                        world.tick()
                 except Exception:
                     pass
             start_tf, end_tf = pick_far_spawn_pair(world)
             ego = spawn_model3(world, start_tf)
-            agent = BehaviorAgent(ego, behavior=behavior)
-            # Configure agent for better rule following
-            try:
-                agent.ignore_traffic_lights(False)  # Respect traffic lights
-                agent.ignore_stop_signs(False)       # Respect stop signs
-                agent.ignore_vehicles(False)         # Avoid collisions
-            except Exception:
-                pass
-            agent.set_destination(end_tf.location)
-            # Warm-up: ensure planner has initial state before the control loop
-            world.tick()
+
+            # Hand ego to Traffic Manager autopilot (canonical CARLA way)
+            ego.set_autopilot(True, tm_port)
+
+            # Warm-up: give TM time to compute route and start accelerating
+            for _ in range(20):
+                world.tick()
+
             # Spawn background NPC traffic once per run, after ego is in the world
             if not npc_vehicles and npc_count > 0:
                 npc_vehicles = spawn_npc_traffic(world, tm_port, npc_count)
+
             goal_tf = end_tf
             # Record starting goal distance for route progress estimation
             try:
                 goal_start_dist_m = distance_to_goal(ego.get_transform(), goal_tf)
             except Exception:
                 goal_start_dist_m = 0.0
+            
+            LOG.info("=== Episode %d/%d: Starting (goal distance: %.1fm) ===", ep + 1, episodes, goal_start_dist_m)
+
             # Reset futures buffer per episode
             futures = FuturesBuffer(capacity=max(64, int(math.ceil(N * future_dt / fixed_dt)) * 3))
 
             ep_frames = 0
             # pending frame queue for lagged future labels
             # each item holds the extracted features for that frame time
-            from collections import deque
             pending = deque()
+            recording_ready = False
+            prime_ticks = 0
 
             while frame_id < max_frames and ep_frames < episode_max_frames:
                 world.tick()
 
-                # If destination reached, stop and end episode
-                if agent.done():
-                    try:
-                        ego.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0, hand_brake=False))
-                    except Exception:
-                        pass
-                    episodes_reached += 1
-                    break
-
                 sim_time = (frame_id + 1) * fixed_dt
-                
+
                 # Extract current state FIRST (for this frame)
                 speed_mps, yaw_rate = get_ego_state(ego)
                 ego_tf = ego.get_transform()
 
-                # Route / command (lightweight)
-                cmd_int, route_xy = extract_cmd_and_route(agent, ego_tf, K, spacing_m=2.0)
+                # Route / command from map only (no BehaviorAgent internals)
+                cmd_int, route_xy, plan_meta = map_cmd_and_route(
+                    world,
+                    ego_tf,
+                    K,
+                    spacing_m=2.0,
+                    return_plan_stats=True,
+                )
+                plan_len = plan_meta.get("plan_len", 0)
+                buffer_len = plan_len  # no separate buffer concept with pure map-based route
+                plan_source = plan_meta.get("plan_source", "map")
 
-                # Compute and apply control immediately after cheap queries
-                ctrl = agent.run_step()
+                goal_dist_m = 0.0
+                if goal_tf is not None:
+                    try:
+                        goal_dist_m = distance_to_goal(ego_tf, goal_tf)
+                    except Exception:
+                        goal_dist_m = 0.0
+
+                # Simple recording gate: wait until ego is moving and we have a route
+                if not recording_ready:
+                    if speed_mps >= ROUTE_PRIME_MIN_SPEED_MPS and route_xy:
+                        prime_ticks += 1
+                        if prime_ticks >= ROUTE_PRIME_MIN_TICKS:
+                            recording_ready = True
+                            LOG.info("  Recording started at frame %d (speed=%.1f m/s)", frame_id, speed_mps)
+                    else:
+                        prime_ticks = 0
+
+                # Light sanity check (non-fatal warning only)
+                if recording_ready:
+                    check_route_sanity(route_xy, frame_id, cmd_int, plan_source)
+
+                # Traffic Manager autopilot already computed and applied control.
+                # We only READ what it did for BC labels.
+                ctrl = ego.get_control()
                 steer_norm = float(getattr(ctrl, "steer", 0.0))
                 throttle = float(getattr(ctrl, "throttle", 0.0))
                 brake = float(getattr(ctrl, "brake", 0.0))
                 gear = int(getattr(ctrl, "gear", 0))
-                ego.apply_control(ctrl)
+
+                # Optional: treat reaching very close to the goal as episode completion.
+                # Only check after recording starts to avoid premature episode endings.
+                if recording_ready and goal_tf is not None and goal_dist_m <= 5.0:
+                    try:
+                        ego.apply_control(
+                            carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0, hand_brake=False)
+                        )
+                    except Exception:
+                        pass
+                    episodes_reached += 1
+                    LOG.info("  Destination reached! (%.1fm from goal)", goal_dist_m)
+                    break
 
                 # Spectator follow (visual debug) - do this after control to keep latency low
                 if spectator is not None:
@@ -339,6 +458,7 @@ def main():
                     "frame_id": frame_id,
                     "sim_time": sim_time,
                     "ego_tf": ego_tf,
+                    "goal_dist_m": goal_dist_m,
                     "speed_mps": speed_mps,
                     "yaw_rate": yaw_rate,
                     "accel_long": float(ax_ego),
@@ -364,8 +484,9 @@ def main():
                     "gear": gear,
                 }
 
-                # NO disk I/O in the control loop! Just collect in memory.
-                pending.append(frame_data)
+                # NO disk I/O in the control loop! Just collect in memory once recording is ready.
+                if recording_ready:
+                    pending.append(frame_data)
                 
                 # Buffer current state for future trajectory labels
                 futures.add(sim_time, ego_tf, speed_mps)
@@ -375,7 +496,7 @@ def main():
 
             # After episode loop: flush remaining pending frames
             # Process any frames that have sufficient future data
-            print(f"Episode {ep+1} ended, writing {len(pending)} frames to disk...")
+            LOG.info("  Writing %d frames to disk...", len(pending))
             horizon_s = N * future_dt
             frames_written = 0
             frames_skipped = 0
@@ -387,7 +508,7 @@ def main():
                 
                 # If we don't have full future trajectory, skip this frame
                 # (last few frames of each episode won't have complete futures)
-                if not samples or len(samples) < N:
+                if not samples or len(samples) < N or any(s is None for s in samples):
                     frames_skipped += 1
                     continue
                     
@@ -395,10 +516,12 @@ def main():
                 wp_future, vel_future = future_waypoints_ego(base_tf, samples)
 
                 # Frames row
-                try:
-                    cur_goal_dist = distance_to_goal(rec["ego_tf"], goal_tf)
-                except Exception:
-                    cur_goal_dist = 0.0
+                cur_goal_dist = rec.get("goal_dist_m", None)
+                if cur_goal_dist is None:
+                    try:
+                        cur_goal_dist = distance_to_goal(rec["ego_tf"], goal_tf)
+                    except Exception:
+                        cur_goal_dist = 0.0
                 route_progress_m = max(0.0, float(goal_start_dist_m - cur_goal_dist))
                 frames_tbl = table_from_pydict(
                     Schemas.FRAMES,
@@ -418,7 +541,7 @@ def main():
                         "speed_mps": [rec["speed_mps"]],
                         "yaw_rate": [rec["yaw_rate"]],
                         "road_option": [rec["cmd_int"]],
-                        "goal_dist_m": [distance_to_goal(rec["ego_tf"], goal_tf)],
+                        "goal_dist_m": [cur_goal_dist],
                         "at_junction": [1 if world.get_map().get_waypoint(rec["ego_tf"].location).is_junction else 0],
                         "dist_to_next_junction": [0.0],
                         "accel_long": [rec["accel_long"]],
@@ -631,10 +754,10 @@ def main():
                 
                 # Count written frames and show progress
                 frames_written += 1
-                if frames_written % 50 == 0:
-                    print(f"  Written {frames_written} frames...")
+                if frames_written % 100 == 0:
+                    LOG.info("    Progress: %d frames written...", frames_written)
             
-            print(f"Episode {ep+1} complete: {frames_written} frames written, {frames_skipped} skipped (no complete futures)")
+            LOG.info("=== Episode %d/%d: Complete (%d frames written, %d skipped) ===", ep + 1, episodes, frames_written, frames_skipped)
 
         # (Writers closed in finally)
 
@@ -648,26 +771,18 @@ def main():
         # If DuckDB backend, export to Parquet BEFORE close
         if backend == "duckdb":
             try:
-                print("Exporting DuckDB tables to Parquet...")
+                LOG.info("Exporting DuckDB tables to Parquet...")
                 frames_w.export_to_parquet_dir(run_dir, compression=pq_compression)
-                print("  ✓ frames exported")
                 route_w.export_to_parquet_dir(run_dir, compression=pq_compression)
-                print("  ✓ route_points exported")
                 actors_w.export_to_parquet_dir(run_dir, compression=pq_compression)
-                print("  ✓ actors exported")
                 tls_w.export_to_parquet_dir(run_dir, compression=pq_compression)
-                print("  ✓ traffic_lights exported")
                 maps_w.export_to_parquet_dir(run_dir, compression=pq_compression)
-                print("  ✓ map_segments exported")
                 fut_w.export_to_parquet_dir(run_dir, compression=pq_compression)
-                print("  ✓ futures exported")
                 obj_w.export_to_parquet_dir(run_dir, compression=pq_compression)
-                print("  ✓ object_tokens exported")
                 bev_w.export_to_parquet_dir(run_dir, compression=pq_compression)
-                print("  ✓ bev_frames exported")
-                print("DuckDB export complete!")
+                LOG.info("DuckDB export complete!")
             except Exception as e:
-                print(f"ERROR during DuckDB export: {e}")
+                LOG.error("ERROR during DuckDB export: %s", e)
                 import traceback
                 traceback.print_exc()
         
@@ -675,7 +790,7 @@ def main():
         try:
             frames_w.close(); route_w.close(); actors_w.close(); tls_w.close(); maps_w.close(); fut_w.close(); obj_w.close(); bev_w.close()
         except Exception as e:
-            print(f"Warning: Error closing writers: {e}")
+            LOG.warning("Error closing writers: %s", e)
         # Cleanup NPCs and ego
         try:
             destroy_ids = []
@@ -688,140 +803,13 @@ def main():
         except Exception:
             pass
 
-    # Integrity + summary
-    # Check for leftover tmp files (means incomplete shard rotation)
-    leftover_tmp = [p for p in os.listdir(run_dir) if p.endswith('.tmp')]
-    intact = len(leftover_tmp) == 0
-
-    # Parquet-level validation: try reading footers to get row counts
-    def _count_rows_in_file(path: str) -> int:
-        try:
-            meta = pq.read_metadata(path)
-            num = meta.num_rows if meta is not None else 0
-            if num:
-                return int(num)
-            tbl = pq.read_table(path)
-            return int(tbl.num_rows)
-        except Exception as exc:
-            print(f"Warning: failed to read parquet metadata '{path}': {exc}")
-            return 0
-
-    def sum_rows(pattern: str) -> int:
-        # Backwards-compat scan for flat files in run_dir
-        if not os.path.isdir(run_dir):
-            return 0
-        total = 0
-        try:
-            entries = os.listdir(run_dir)
-        except Exception as exc:
-            print(f"Warning: unable to list '{run_dir}' during integrity check: {exc}")
-            return 0
-        paths = [os.path.join(run_dir, p) for p in entries if p.startswith(pattern) and p.endswith('.parquet')]
-        for p in paths:
-            total += _count_rows_in_file(p)
-        return total
-
-    # New: scan subdirectories used by ParquetDatasetWriter (and DuckDB export)
-    def sum_rows_dir(subdir: str) -> int:
-        d = os.path.join(run_dir, subdir)
-        if not os.path.isdir(d):
-            return 0
-        total = 0
-        pattern = os.path.join(d, "**", "*.parquet")
-        for p in glob.glob(pattern, recursive=True):
-            total += _count_rows_in_file(p)
-        return total
-
-    # Combine flat-file and directory-based totals
-    frames_total = sum_rows('frames-') + sum_rows_dir('frames')
-    route_total = sum_rows('route_points-') + sum_rows_dir('route_points')
-    actors_total = sum_rows('actors-') + sum_rows_dir('actors')
-    tls_total = sum_rows('traffic_lights-') + sum_rows_dir('traffic_lights')
-    maps_total = sum_rows('map_segments-') + sum_rows_dir('map_segments')
-    futures_total = sum_rows('futures-') + sum_rows_dir('futures')
-    objects_total = sum_rows('object_tokens-') + sum_rows_dir('object_tokens')
-    bev_total = sum_rows('bev_frames-') + sum_rows_dir('bev_frames')
-
-    # DuckDB integrity counts
-    duck_counts = {}
-    try:
-        if backend == "duckdb":
-            duck_counts = {
-                "frames": frames_w.row_count(),
-                "route_points": route_w.row_count(),
-                "actors": actors_w.row_count(),
-                "traffic_lights": tls_w.row_count(),
-                "map_segments": maps_w.row_count(),
-                "futures": fut_w.row_count(),
-                "object_tokens": obj_w.row_count(),
-                "bev_frames": bev_w.row_count(),
-            }
-    except Exception:
-        duck_counts = {}
-
-    # Anomaly checks
-    issues = []
-    if frames_total <= 0:
-        issues.append("no_frames")
-    if futures_total % max(1, N) != 0:
-        issues.append("futures_not_divisible_by_N")
-    # expected lower bound for matured frames (approx)
-    horizon_ticks = int(math.ceil((N * future_dt) / max(1e-6, fixed_dt)))
-    matured_expected_lower = max(0, frames_rows - episodes * horizon_ticks)
-    matured_est = futures_rows // max(1, N)
-    if matured_est < max(0, int(0.7 * matured_expected_lower)) and frames_rows > 0:
-        issues.append("too_few_matured_frames")
-    # route coverage sanity
-    if K > 0 and frames_rows > 0:
-        route_cov = route_rows / float(K * frames_rows)
-        if route_cov < 0.4:
-            issues.append("low_route_coverage")
-    # actor/tl/map presence if npc requested
-    if npc_count > 0 and actors_rows / float(max(1, frames_rows)) < 1.0:
-        issues.append("low_actors_density")
-    # Per-step schema presence
-    if bev_total != frames_total:
-        issues.append("bev_count_mismatch")
-    if objects_total < actors_total:
-        issues.append("object_tokens_missing")
-
-    # Decode a small BEV sample to validate tensor shape and values
-    try:
-        # Check both flat files and subdirectories
-        bev_paths = []
-        bev_paths.extend([os.path.join(run_dir, p) for p in os.listdir(run_dir) 
-                          if p.startswith('bev_frames-') and p.endswith('.parquet')])
-        bev_dir = os.path.join(run_dir, 'bev_frames')
-        if os.path.isdir(bev_dir):
-            bev_paths.extend([os.path.join(bev_dir, p) for p in os.listdir(bev_dir)
-                              if p.endswith('.parquet')])
-        bev_paths.sort()
-        if bev_paths:
-            pf = pq.ParquetFile(bev_paths[0])
-            tbl = pf.read_row_group(0, columns=["C", "H", "W", "data"])
-            if tbl.num_rows > 0:
-                C = int(tbl.column(0)[0].as_py())
-                H = int(tbl.column(1)[0].as_py())
-                W = int(tbl.column(2)[0].as_py())
-                blob = tbl.column(3)[0].as_buffer().to_pybytes()
-                raw = zlib.decompress(blob)
-                arr = np.load(io.BytesIO(raw), allow_pickle=False)
-                if not (arr.shape == (C, H, W)):
-                    issues.append("bev_shape_mismatch")
-                if not np.isfinite(arr).all():
-                    issues.append("bev_contains_nonfinite")
-    except Exception:
-        issues.append("bev_decode_failed")
-
+    # Simple summary
     duration_s = time.time() - start_wall
-    print(f"Integrity: {'OK' if intact else 'PENDING (tmp files remain)'}")
-    print(f"Episodes: {episodes}, reached goal: {episodes_reached}")
-    if duck_counts:
-        print(f"Frames (mem/db/file): {frames_rows}/{duck_counts.get('frames',0)}/{frames_total}, Routes: {route_rows}/{duck_counts.get('route_points',0)}/{route_total}, Actors: {actors_rows}/{duck_counts.get('actors',0)}/{actors_total}, TLs: {tls_rows}/{duck_counts.get('traffic_lights',0)}/{tls_total}, MapSegs: {map_rows}/{duck_counts.get('map_segments',0)}/{maps_total}, Futures: {futures_rows}/{duck_counts.get('futures',0)}/{futures_total}, ObjTokens: {duck_counts.get('object_tokens',0)}, BEV: {duck_counts.get('bev_frames',0)}")
-    else:
-        print(f"Frames (mem/file): {frames_rows}/{frames_total}, Routes: {route_rows}/{route_total}, Actors: {actors_rows}/{actors_total}, TLs: {tls_rows}/{tls_total}, MapSegs: {map_rows}/{maps_total}, Futures: {futures_rows}/{futures_total}, ObjTokens: {objects_total}, BEV: {bev_total}")
-    print(f"Wall time: {duration_s:.1f}s, ~{(frames_rows/duration_s if duration_s>0 else 0):.1f} fps")
-    print(f"Checks: {'OK' if not issues else 'ISSUES -> ' + ','.join(issues)}")
+    LOG.info("=== Collection Complete ===")
+    LOG.info("Episodes: %d, reached goal: %d", episodes, episodes_reached)
+    LOG.info("Frames written: %d", frames_rows)
+    LOG.info("Wall time: %.1fs, ~%.1f fps", duration_s, frames_rows/duration_s if duration_s > 0 else 0)
+    LOG.info("Output directory: %s", run_dir)
 
 
 if __name__ == "__main__":
