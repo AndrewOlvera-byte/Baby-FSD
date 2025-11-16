@@ -1,0 +1,66 @@
+# Connection
+host: "127.0.0.1"
+port: 2000
+tm_port: 8000
+
+# Output
+out_dir: "data/BC_v1"
+
+# Sim timing
+fixed_dt: 0.05         # 20 Hz
+future_dt: 0.2         # label spacing
+
+# Labels / tokens
+K: 32                  # route points ahead (ego frame)
+N: 12                   # future waypoints/vels
+
+# Extraction windows
+actor_radius: 60.0
+window_m: 80.0
+
+# Performance
+no_rendering: false    # show window for debug (set true for throughput)
+shard_rows: 1000
+max_frames: 1000
+
+# Agent behavior
+behavior: "normal"     # cautious | normal | aggressive
+wheelbase_m: 2.875
+
+# Episodes and traffic (debug-friendly)
+episodes: 1
+episode_max_frames: 400
+npc_count: 40
+
+# Visual debug
+spectator_follow: true
+spectator_mode: "chase"   # "fpv" or "chase"
+
+# BEV configuration
+bev:
+  meters_x: 100.0        # forward/back extent (x)
+  meters_y: 80.0         # left/right extent (y)
+  resolution_m: 0.25     # meters per pixel
+  lane_width_m: 3.5
+  route_corridor_width_m: 6.0
+  centerline_thickness_m: 0.5
+  drivable_thickness_m: 5.0
+  actor_radius_m: 1.0
+
+# Validation thresholds (sanity checks)
+validation:
+  max_speed_mps: 50.0
+  max_abs_accel_mps2: 12.0
+  min_route_cov: 0.6
+  require_bev_per_frame: true
+  require_futures_per_frame: true
+  require_objects_per_actor: true
+
+# Parquet storage
+parquet:
+  compression: gzip     # gzip is robust on Windows; code will auto-fallback if needed
+
+# Storage backend
+storage:
+  backend: duckdb        # duckdb | parquet_dataset
+
