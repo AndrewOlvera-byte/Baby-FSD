@@ -260,12 +260,6 @@ def main():
             while frame_id < max_frames and ep_frames < episode_max_frames:
                 world.tick()
 
-                # Keep planner state fresh (matches working visual confirm loop)
-                try:
-                    agent.update_information()
-                except Exception:
-                    pass
-                
                 # If destination reached, stop and end episode
                 if agent.done():
                     try:
