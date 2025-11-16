@@ -62,5 +62,5 @@ parquet:
 
 # Storage backend
 storage:
-  backend: duckdb        # duckdb | parquet_dataset
+  backend: parquet_dataset  # parquet_dataset (simple, robust) | duckdb (faster but complex)
 

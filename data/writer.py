@@ -188,8 +188,10 @@ class DuckDBWriter:
         out_dir = os.path.join(base_out_dir, self.table_name)
         os.makedirs(out_dir, exist_ok=True)
         comp = (compression or "gzip").upper()
+        # Convert Windows path to forward slashes for DuckDB
+        out_path = out_dir.replace('\\', '/') + '/part-*.parquet'
         self._con.execute(
-            f"COPY {self.table_name} TO '{out_dir}/part-*.parquet' (FORMAT PARQUET, COMPRESSION '{comp}', PER_THREAD_OUTPUT TRUE);"
+            f"COPY {self.table_name} TO '{out_path}' (FORMAT PARQUET, COMPRESSION '{comp}', PER_THREAD_OUTPUT TRUE);"
         )
 
     def close(self) -> None:

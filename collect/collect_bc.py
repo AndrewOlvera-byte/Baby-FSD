@@ -1,4 +1,6 @@
 import argparse
+import glob
+import io
 import json
 import math
 import os
@@ -257,6 +259,12 @@ def main():
 
             while frame_id < max_frames and ep_frames < episode_max_frames:
                 world.tick()
+
+                # Keep planner state fresh (matches working visual confirm loop)
+                try:
+                    agent.update_information()
+                except Exception:
+                    pass
                 
                 # If destination reached, stop and end episode
                 if agent.done():
@@ -273,15 +281,36 @@ def main():
                 speed_mps, yaw_rate = get_ego_state(ego)
                 ego_tf = ego.get_transform()
 
-                # Route / command
+                # Route / command (lightweight)
                 cmd_int, route_xy = extract_cmd_and_route(agent, ego_tf, K, spacing_m=2.0)
 
-                # Actors
-                actors = collect_nearby_actors(world, ego, radius)
+                # Compute and apply control immediately after cheap queries
+                ctrl = agent.run_step()
+                steer_norm = float(getattr(ctrl, "steer", 0.0))
+                throttle = float(getattr(ctrl, "throttle", 0.0))
+                brake = float(getattr(ctrl, "brake", 0.0))
+                gear = int(getattr(ctrl, "gear", 0))
+                ego.apply_control(ctrl)
 
-                # Map vectors
-                map_polys = extract_lane_centerline_segments(world.get_map(), ego_tf, window_m=window_m, step_m=2.0)
-                tls = extract_traffic_light_stoplines(world, ego_tf, window_m=window_m)
+                # Spectator follow (visual debug) - do this after control to keep latency low
+                if spectator is not None:
+                    yaw_deg = ego_tf.rotation.yaw
+                    yaw = math.radians(yaw_deg)
+                    if spectator_mode == "fpv":
+                        forward = 0.7
+                        height = 1.4
+                        dx = forward * math.cos(yaw)
+                        dy = forward * math.sin(yaw)
+                        loc = ego_tf.location + carla.Location(x=dx, y=dy, z=height)
+                        rot = carla.Rotation(pitch=0.0, yaw=yaw_deg)
+                    else:
+                        back = 8.0
+                        height = 4.0
+                        dx = -back * math.cos(yaw)
+                        dy = -back * math.sin(yaw)
+                        loc = ego_tf.location + carla.Location(x=dx, y=dy, z=height)
+                        rot = carla.Rotation(pitch=-10.0, yaw=yaw_deg)
+                    spectator.set_transform(carla.Transform(loc, rot))
 
                 # Ego kinematics (extended)
                 acc_world = ego.get_acceleration()
@@ -290,15 +319,12 @@ def main():
                 s = math.sin(-yaw_rad)
                 ax_ego = acc_world.x * c - acc_world.y * s
                 ay_ego = acc_world.x * s + acc_world.y * c
-                # curvature from yaw_rate/speed (stable when speed>0.5 m/s)
                 curvature = float(yaw_rate / max(speed_mps, 0.5))
                 steer_angle_rad = float(math.atan(wheelbase_m * curvature))
                 wp = world.get_map().get_waypoint(ego_tf.location, project_to_road=True, lane_type=carla.LaneType.Driving)
                 speed_limit_mps = float(getattr(wp, "speed_limit", 0.0) or 0.0)
                 if speed_limit_mps > 30.0:
-                    # CARLA sometimes reports km/h; detect and convert
                     speed_limit_mps = speed_limit_mps / 3.6
-                # Basic time-of-day from sun azimuth (approx)
                 try:
                     sun_az = float(world.get_weather().sun_azimuth_angle)
                 except Exception:
@@ -307,12 +333,14 @@ def main():
                 tod_sin = math.sin(ang)
                 tod_cos = math.cos(ang)
 
-                # Rasterize BEV now (from GT lists)
+                # Heavy feature extraction happens after control to avoid latency
+                actors = collect_nearby_actors(world, ego, radius)
+                map_polys = extract_lane_centerline_segments(world.get_map(), ego_tf, window_m=window_m, step_m=2.0)
+                tls = extract_traffic_light_stoplines(world, ego_tf, window_m=window_m)
                 bev_tensor, bev_meta = rasterize_bev(route_xy, map_polys, tls, actors, bev_cfg)
                 bev_bytes = encode_bev_to_bytes(bev_tensor)
 
-                # Placeholder for control values (will be filled after run_step)
-                # We need to store current frame state before computing next control
+                # Store frame data after all features are computed
                 frame_data = {
                     "frame_id": frame_id,
                     "sim_time": sim_time,
@@ -336,293 +364,14 @@ def main():
                     "tls": tls,
                     "bev_meta": bev_meta,
                     "bev_bytes": bev_bytes,
+                    "steer_norm": steer_norm,
+                    "throttle": throttle,
+                    "brake": brake,
+                    "gear": gear,
                 }
 
-                # Process matured frames BEFORE computing control (sufficient future available)
-                horizon_s = N * future_dt
-                while pending and (sim_time - pending[0]["sim_time"]) >= horizon_s:
-                    rec = pending.popleft()
-                    base_tf = rec["ego_tf"]
-                    deltas = [future_dt * (i + 1) for i in range(N)]
-                    samples = futures.sample_future(rec["sim_time"], deltas)
-                    wp_future, vel_future = future_waypoints_ego(base_tf, samples)
-
-                # Frames row
-                    # Route progress approximation by decreasing distance to goal
-                    try:
-                        cur_goal_dist = distance_to_goal(rec["ego_tf"], goal_tf)
-                    except Exception:
-                        cur_goal_dist = 0.0
-                    route_progress_m = max(0.0, float(goal_start_dist_m - cur_goal_dist))
-                    frames_tbl = table_from_pydict(
-                        Schemas.FRAMES,
-                        {
-                            "run_id": [os.path.basename(run_dir)],
-                            "shard_id": [1],
-                            "frame_id": [rec["frame_id"]],
-                            "sim_time": [rec["sim_time"]],
-                            "fixed_dt": [fixed_dt],
-                            "future_dt": [future_dt],
-                            "map": [world.get_map().name],
-                            "weather": [0],
-                            "seed": [0],
-                            "ego_x_w": [rec["ego_tf"].location.x],
-                            "ego_y_w": [rec["ego_tf"].location.y],
-                            "ego_yaw_w": [rec["ego_tf"].rotation.yaw],
-                            "speed_mps": [rec["speed_mps"]],
-                            "yaw_rate": [rec["yaw_rate"]],
-                            "road_option": [rec["cmd_int"]],
-                            "goal_dist_m": [distance_to_goal(rec["ego_tf"], goal_tf)],
-                            "at_junction": [1 if world.get_map().get_waypoint(rec["ego_tf"].location).is_junction else 0],
-                            "dist_to_next_junction": [0.0],
-                            "accel_long": [rec["accel_long"]],
-                            "accel_lat": [rec["accel_lat"]],
-                            "steer_angle_rad": [rec["steer_angle_rad"]],
-                            "steer_norm": [rec["steer_norm"]],
-                            "throttle": [rec["throttle"]],
-                            "brake": [rec["brake"]],
-                            "curvature": [rec["curvature"]],
-                            "gear": [rec["gear"]],
-                            "speed_limit_mps": [rec["speed_limit_mps"]],
-                            "command": [rec["command"]],
-                            "time_of_day_sin": [rec["time_of_day_sin"]],
-                            "time_of_day_cos": [rec["time_of_day_cos"]],
-                            "route_progress_m": [route_progress_m],
-                            "route_id": [rec["route_id"]],
-                            "scenario_id": [rec["scenario_id"]],
-                            "frame_ref": ["ego_t"],
-                        },
-                    )
-                    frames_w.append_table(frames_tbl)
-                    frames_rows += 1
-
-                # Route points rows
-                    if rec["route_xy"]:
-                        # Derive heading tangents and s-fraction
-                        xs = [float(p[0]) for p in rec["route_xy"]]
-                        ys = [float(p[1]) for p in rec["route_xy"]]
-                        dxs = []
-                        dys = []
-                        curvs = []
-                        s = [0.0]
-                        for i in range(len(xs)):
-                            if i == 0:
-                                dx = xs[1] - xs[0] if len(xs) > 1 else 0.0
-                                dy = ys[1] - ys[0] if len(ys) > 1 else 0.0
-                            else:
-                                dx = xs[i] - xs[i - 1]
-                                dy = ys[i] - ys[i - 1]
-                                s.append(s[-1] + math.hypot(dx, dy))
-                            dxs.append(float(dx))
-                            dys.append(float(dy))
-                        s_total = s[-1] if s else 1.0
-                        s_frac = [float(si / s_total) if s_total > 0 else 0.0 for si in s]
-                        for i in range(len(xs)):
-                            # crude curvature from discrete second derivative
-                            if 0 < i < len(xs) - 1:
-                                x0, y0 = xs[i - 1], ys[i - 1]
-                                x1, y1 = xs[i], ys[i]
-                                x2, y2 = xs[i + 1], ys[i + 1]
-                                a1x, a1y = x1 - x0, y1 - y0
-                                a2x, a2y = x2 - x1, y2 - y1
-                                cross = abs(a1x * a2y - a1y * a2x)
-                                denom = (math.hypot(a1x, a1y) * math.hypot(a2x, a2y)) + 1e-6
-                                curv = cross / denom
-                            else:
-                                curv = 0.0
-                            curvs.append(float(curv))
-
-                        route_tbl = table_from_pydict(
-                        Schemas.ROUTE_POINTS,
-                        {
-                                "run_id": [os.path.basename(run_dir)] * len(rec["route_xy"]),
-                                "shard_id": [1] * len(rec["route_xy"]),
-                                "frame_id": [rec["frame_id"]] * len(rec["route_xy"]),
-                                "idx": list(range(len(rec["route_xy"]))),
-                                "x_ego": xs,
-                                "y_ego": ys,
-                                "dx": dxs,
-                                "dy": dys,
-                                "curvature": curvs,
-                                "s_frac": s_frac,
-                        },
-                        )
-                        route_w.append_table(route_tbl)
-                        route_rows += len(rec["route_xy"])
-
-                # Actors rows
-                    if rec["actors"]:
-                        actors_tbl = table_from_pydict(
-                        Schemas.ACTORS,
-                        {
-                                "run_id": [os.path.basename(run_dir)] * len(rec["actors"]),
-                                "shard_id": [1] * len(rec["actors"]),
-                                "frame_id": [rec["frame_id"]] * len(rec["actors"]),
-                                "actor_id": [a["actor_id"] for a in rec["actors"]],
-                                "type_id": [a["type_id"] for a in rec["actors"]],
-                                "x_ego": [a["x_ego"] for a in rec["actors"]],
-                                "y_ego": [a["y_ego"] for a in rec["actors"]],
-                                "yaw": [a["yaw"] for a in rec["actors"]],
-                                "vx": [a["vx"] for a in rec["actors"]],
-                                "vy": [a["vy"] for a in rec["actors"]],
-                                "length": [a["length"] for a in rec["actors"]],
-                                "width": [a["width"] for a in rec["actors"]],
-                        },
-                        )
-                        actors_w.append_table(actors_tbl)
-                        actors_rows += len(rec["actors"])
-
-                        # Object tokens table (expanded fields, with idx)
-                        obj_tbl = table_from_pydict(
-                            Schemas.OBJECT_TOKENS,
-                            {
-                                "run_id": [os.path.basename(run_dir)] * len(rec["actors"]),
-                                "shard_id": [1] * len(rec["actors"]),
-                                "frame_id": [rec["frame_id"]] * len(rec["actors"]),
-                                "idx": list(range(len(rec["actors"]))),
-                                "actor_id": [a["actor_id"] for a in rec["actors"]],
-                                "type_id": [a["type_id"] for a in rec["actors"]],
-                                "x_ego": [a["x_ego"] for a in rec["actors"]],
-                                "y_ego": [a["y_ego"] for a in rec["actors"]],
-                                "sin_yaw": [a.get("sin_yaw", 0.0) for a in rec["actors"]],
-                                "cos_yaw": [a.get("cos_yaw", 1.0) for a in rec["actors"]],
-                                "length": [a["length"] for a in rec["actors"]],
-                                "width": [a["width"] for a in rec["actors"]],
-                                "vx": [a["vx"] for a in rec["actors"]],
-                                "vy": [a["vy"] for a in rec["actors"]],
-                                "oncoming_flag": [a.get("oncoming_flag", 0) for a in rec["actors"]],
-                                "priority_flag": [a.get("priority_flag", 0) for a in rec["actors"]],
-                            },
-                        )
-                        obj_w.append_table(obj_tbl)
-
-                # TL rows
-                    if rec["tls"]:
-                        tls_tbl = table_from_pydict(
-                        Schemas.TRAFFIC_LIGHTS,
-                        {
-                                "run_id": [os.path.basename(run_dir)] * len(rec["tls"]),
-                                "shard_id": [1] * len(rec["tls"]),
-                                "frame_id": [rec["frame_id"]] * len(rec["tls"]),
-                                "tl_id": [t["tl_id"] for t in rec["tls"]],
-                                "state": [t["state"] for t in rec["tls"]],
-                                "stop_x_ego": [t["stop_x_ego"] for t in rec["tls"]],
-                                "stop_y_ego": [t["stop_y_ego"] for t in rec["tls"]],
-                        },
-                        )
-                        tls_w.append_table(tls_tbl)
-                        tls_rows += len(rec["tls"])
-
-                # Map polyline rows (ragged coords)
-                    if rec["map_polys"]:
-                        maps_tbl = table_from_pydict(
-                        Schemas.MAP_SEGMENTS,
-                        {
-                                "run_id": [os.path.basename(run_dir)] * len(rec["map_polys"]),
-                                "shard_id": [1] * len(rec["map_polys"]),
-                                "frame_id": [rec["frame_id"]] * len(rec["map_polys"]),
-                                "seg_id": [p["seg_id"] for p in rec["map_polys"]],
-                                "kind": [p["kind"] for p in rec["map_polys"]],
-                                "coords_x": [p["coords_x"] for p in rec["map_polys"]],
-                                "coords_y": [p["coords_y"] for p in rec["map_polys"]],
-                                "lane_id": [p.get("lane_id", 0) for p in rec["map_polys"]],
-                                "lane_type": [p.get("lane_type", 0) for p in rec["map_polys"]],
-                                "speed_limit": [p.get("speed_limit", 0.0) for p in rec["map_polys"]],
-                        },
-                        )
-                        maps_w.append_table(maps_tbl)
-                        map_rows += len(rec["map_polys"])
-
-                # Futures rows
-                    if wp_future:
-                        fut_tbl = table_from_pydict(
-                        Schemas.FUTURES,
-                        {
-                                "run_id": [os.path.basename(run_dir)] * len(wp_future),
-                                "shard_id": [1] * len(wp_future),
-                                "frame_id": [rec["frame_id"]] * len(wp_future),
-                                "i": list(range(len(wp_future))),
-                                "x_ego": [p[0] for p in wp_future],
-                                "y_ego": [p[1] for p in wp_future],
-                                "v_mps": vel_future,
-                        },
-                        )
-                        fut_w.append_table(fut_tbl)
-                        futures_rows += len(wp_future)
-
-                # BEV frame row (exactly one per frame)
-                    bev_meta = rec["bev_meta"]
-                    # augment meta with ego origin and coordinate frame info
-                    bev_meta_aug = dict(bev_meta)
-                    bev_meta_aug.update({
-                        "ego_x_w": float(rec["ego_tf"].location.x),
-                        "ego_y_w": float(rec["ego_tf"].location.y),
-                        "ego_yaw_w": float(rec["ego_tf"].rotation.yaw),
-                        "frame_ref": "ego_t",
-                    })
-                    bev_tbl = table_from_pydict(
-                        Schemas.BEV_FRAMES,
-                        {
-                            "run_id": [os.path.basename(run_dir)],
-                            "shard_id": [1],
-                            "frame_id": [rec["frame_id"]],
-                            "C": [bev_meta_aug["C"]],
-                            "H": [bev_meta_aug["H"]],
-                            "W": [bev_meta_aug["W"]],
-                            "dtype": [bev_meta_aug["dtype"]],
-                            "encoding": [bev_meta_aug["encoding"]],
-                            "channel_spec": [bev_meta_aug["channel_spec"]],
-                            "meters_per_px": [bev_meta_aug["meters_per_px"]],
-                            "x_fwd_m": [bev_meta_aug["x_fwd_m"]],
-                            "y_left_m": [bev_meta_aug["y_left_m"]],
-                            "ego_x_w": [bev_meta_aug["ego_x_w"]],
-                            "ego_y_w": [bev_meta_aug["ego_y_w"]],
-                            "ego_yaw_w": [bev_meta_aug["ego_yaw_w"]],
-                            "spec_version": [bev_meta_aug.get("spec_version", 1)],
-                            "norms_version": [bev_meta_aug.get("norms_version", 1)],
-                            "frame_ref": [bev_meta_aug["frame_ref"]],
-                            "data": [rec["bev_bytes"]],
-                        },
-                    )
-                    bev_w.append_table(bev_tbl)
-
-                # Spectator follow (visual debug) - do this before control to minimize delay
-                if spectator is not None:
-                    yaw_deg = ego_tf.rotation.yaw
-                    yaw = math.radians(yaw_deg)
-                    if spectator_mode == "fpv":
-                        # first-person-ish view near windshield
-                        forward = 0.7
-                        height = 1.4
-                        dx = forward * math.cos(yaw)
-                        dy = forward * math.sin(yaw)
-                        loc = ego_tf.location + carla.Location(x=dx, y=dy, z=height)
-                        rot = carla.Rotation(pitch=0.0, yaw=yaw_deg)
-                    else:
-                        # chase cam behind
-                        back = 8.0
-                        height = 4.0
-                        dx = -back * math.cos(yaw)
-                        dy = -back * math.sin(yaw)
-                        loc = ego_tf.location + carla.Location(x=dx, y=dy, z=height)
-                        rot = carla.Rotation(pitch=-10.0, yaw=yaw_deg)
-                    spectator.set_transform(carla.Transform(loc, rot))
-
-                # Compute and apply control (LAST, right before next tick)
-                # run_step() internally calls update_information()
-                ctrl = agent.run_step()
-                
-                # Update frame_data with control values
-                frame_data["steer_norm"] = float(getattr(ctrl, "steer", 0.0))
-                frame_data["throttle"] = float(getattr(ctrl, "throttle", 0.0))
-                frame_data["brake"] = float(getattr(ctrl, "brake", 0.0))
-                frame_data["gear"] = int(getattr(ctrl, "gear", 0))
-                
-                # Add to pending queue for future labeling
+                # NO disk I/O in the control loop! Just collect in memory.
                 pending.append(frame_data)
-                
-                # Apply control to vehicle
-                ego.apply_control(ctrl)
                 
                 # Buffer current state for future trajectory labels
                 futures.add(sim_time, ego_tf, speed_mps)
@@ -632,8 +381,10 @@ def main():
 
             # After episode loop: flush remaining pending frames
             # Process any frames that have sufficient future data
-            print(f"Episode {ep+1} ended, flushing {len(pending)} pending frames...")
+            print(f"Episode {ep+1} ended, writing {len(pending)} frames to disk...")
             horizon_s = N * future_dt
+            frames_written = 0
+            frames_skipped = 0
             while pending:
                 rec = pending.popleft()
                 # Check if we have enough future data
@@ -643,6 +394,7 @@ def main():
                 # If we don't have full future trajectory, skip this frame
                 # (last few frames of each episode won't have complete futures)
                 if not samples or len(samples) < N:
+                    frames_skipped += 1
                     continue
                     
                 base_tf = rec["ego_tf"]
@@ -882,6 +634,13 @@ def main():
                     },
                 )
                 bev_w.append_table(bev_tbl)
+                
+                # Count written frames and show progress
+                frames_written += 1
+                if frames_written % 50 == 0:
+                    print(f"  Written {frames_written} frames...")
+            
+            print(f"Episode {ep+1} complete: {frames_written} frames written, {frames_skipped} skipped (no complete futures)")
 
         # (Writers closed in finally)
 
@@ -891,24 +650,38 @@ def main():
             tm.set_synchronous_mode(original_sync)
         except Exception:
             pass
-        # Finalize writers even on early exit
+        
+        # If DuckDB backend, export to Parquet BEFORE close
+        if backend == "duckdb":
+            try:
+                print("Exporting DuckDB tables to Parquet...")
+                frames_w.export_to_parquet_dir(run_dir, compression=pq_compression)
+                print("  ✓ frames exported")
+                route_w.export_to_parquet_dir(run_dir, compression=pq_compression)
+                print("  ✓ route_points exported")
+                actors_w.export_to_parquet_dir(run_dir, compression=pq_compression)
+                print("  ✓ actors exported")
+                tls_w.export_to_parquet_dir(run_dir, compression=pq_compression)
+                print("  ✓ traffic_lights exported")
+                maps_w.export_to_parquet_dir(run_dir, compression=pq_compression)
+                print("  ✓ map_segments exported")
+                fut_w.export_to_parquet_dir(run_dir, compression=pq_compression)
+                print("  ✓ futures exported")
+                obj_w.export_to_parquet_dir(run_dir, compression=pq_compression)
+                print("  ✓ object_tokens exported")
+                bev_w.export_to_parquet_dir(run_dir, compression=pq_compression)
+                print("  ✓ bev_frames exported")
+                print("DuckDB export complete!")
+            except Exception as e:
+                print(f"ERROR during DuckDB export: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Finalize writers AFTER export (for DuckDB) or immediately (for other backends)
         try:
             frames_w.close(); route_w.close(); actors_w.close(); tls_w.close(); maps_w.close(); fut_w.close(); obj_w.close(); bev_w.close()
-        except Exception:
-            pass
-        # If DuckDB backend, export to Parquet after close
-        try:
-            if backend == "duckdb":
-                frames_w.export_to_parquet_dir(run_dir, compression=pq_compression)
-                route_w.export_to_parquet_dir(run_dir, compression=pq_compression)
-                actors_w.export_to_parquet_dir(run_dir, compression=pq_compression)
-                tls_w.export_to_parquet_dir(run_dir, compression=pq_compression)
-                maps_w.export_to_parquet_dir(run_dir, compression=pq_compression)
-                fut_w.export_to_parquet_dir(run_dir, compression=pq_compression)
-                obj_w.export_to_parquet_dir(run_dir, compression=pq_compression)
-                bev_w.export_to_parquet_dir(run_dir, compression=pq_compression)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Warning: Error closing writers: {e}")
         # Cleanup NPCs and ego
         try:
             destroy_ids = []
@@ -927,42 +700,42 @@ def main():
     intact = len(leftover_tmp) == 0
 
     # Parquet-level validation: try reading footers to get row counts
+    def _count_rows_in_file(path: str) -> int:
+        try:
+            meta = pq.read_metadata(path)
+            num = meta.num_rows if meta is not None else 0
+            if num:
+                return int(num)
+            tbl = pq.read_table(path)
+            return int(tbl.num_rows)
+        except Exception as exc:
+            print(f"Warning: failed to read parquet metadata '{path}': {exc}")
+            return 0
+
     def sum_rows(pattern: str) -> int:
         # Backwards-compat scan for flat files in run_dir
-        paths = [os.path.join(run_dir, p) for p in os.listdir(run_dir) if p.startswith(pattern) and p.endswith('.parquet')]
+        if not os.path.isdir(run_dir):
+            return 0
         total = 0
+        try:
+            entries = os.listdir(run_dir)
+        except Exception as exc:
+            print(f"Warning: unable to list '{run_dir}' during integrity check: {exc}")
+            return 0
+        paths = [os.path.join(run_dir, p) for p in entries if p.startswith(pattern) and p.endswith('.parquet')]
         for p in paths:
-            try:
-                pf = pq.ParquetFile(p)
-                num = pf.metadata.num_rows if pf.metadata is not None else 0
-                # Fallback if metadata reports 0 unexpectedly
-                if not num:
-                    tbl = pf.read()
-                    num = tbl.num_rows
-                total += int(num)
-            except Exception:
-                pass
+            total += _count_rows_in_file(p)
         return total
 
-    # New: scan subdirectories used by ParquetDatasetWriter
+    # New: scan subdirectories used by ParquetDatasetWriter (and DuckDB export)
     def sum_rows_dir(subdir: str) -> int:
         d = os.path.join(run_dir, subdir)
         if not os.path.isdir(d):
             return 0
         total = 0
-        for fn in os.listdir(d):
-            if not fn.endswith('.parquet'):
-                continue
-            p = os.path.join(d, fn)
-            try:
-                pf = pq.ParquetFile(p)
-                num = pf.metadata.num_rows if pf.metadata is not None else 0
-                if not num:
-                    tbl = pf.read()
-                    num = tbl.num_rows
-                total += int(num)
-            except Exception:
-                pass
+        pattern = os.path.join(d, "**", "*.parquet")
+        for p in glob.glob(pattern, recursive=True):
+            total += _count_rows_in_file(p)
         return total
 
     # Combine flat-file and directory-based totals
@@ -1030,10 +803,6 @@ def main():
                               if p.endswith('.parquet')])
         bev_paths.sort()
         if bev_paths:
-            import io
-            import numpy as np  # noqa: F401
-            import pyarrow as pa  # noqa: F401
-            import pyarrow.parquet as pq  # noqa: F401
             pf = pq.ParquetFile(bev_paths[0])
             tbl = pf.read_row_group(0, columns=["C", "H", "W", "data"])
             if tbl.num_rows > 0:
@@ -1042,8 +811,7 @@ def main():
                 W = int(tbl.column(2)[0].as_py())
                 blob = tbl.column(3)[0].as_buffer().to_pybytes()
                 raw = zlib.decompress(blob)
-                import io as _io
-                arr = np.load(_io.BytesIO(raw), allow_pickle=False)
+                arr = np.load(io.BytesIO(raw), allow_pickle=False)
                 if not (arr.shape == (C, H, W)):
                     issues.append("bev_shape_mismatch")
                 if not np.isfinite(arr).all():
