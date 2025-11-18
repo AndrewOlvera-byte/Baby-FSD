@@ -1,0 +1,8 @@
+speed:
+  allow_tf32: true              # Enable TensorFloat-32 for faster matmul on Ampere+
+  allow_fp16_reduced_precision_reduction: true  # Faster reductions on RTX 50-series
+  cudnn_benchmark: true         # Auto-tune cuDNN kernels for your specific input sizes
+  cudnn_deterministic: false    # Disable for max performance
+  cudnn_allow_tf32: true        # TF32 in cuDNN convolutions
+  accelerator: gpu              # cpu | auto | gpu
+  precision: bf16               # bfloat16 is optimal for RTX 5070 Ti (better than fp16)

@@ -1,0 +1,5 @@
+model:
+  name: resnet50_tv
+  num_classes: 10
+  dropout: 0.0
+

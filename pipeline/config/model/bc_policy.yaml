@@ -1,0 +1,22 @@
+name: bc_policy
+
+# Model dimensions
+d_model: 256
+n_heads: 8
+n_layers: 6
+dropout: 0.1
+
+# Future prediction
+n_future_steps: 12
+
+# ViT params for BEV
+patch_size: [8, 8]
+
+# MLP hidden dimensions
+ego_hidden: 128
+route_hidden: 128
+object_hidden: 128
+
+# Object embeddings
+n_object_types: 4  # vehicle, pedestrian, bike, other
+

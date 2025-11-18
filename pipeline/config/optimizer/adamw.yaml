@@ -1,0 +1,7 @@
+optimizer:
+  name: "adamw"
+  lr: 3e-4
+  weight_decay: 0.01
+  sched:
+    name: "none"
+    args: {}

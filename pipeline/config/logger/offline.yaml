@@ -1,0 +1,4 @@
+logger:
+  name: "offline"
+  dir: "outputs"
+  log_interval: 200

@@ -1,0 +1,19 @@
+defaults:
+  - exp: bc_train
+  - trainer: bc
+  - modes: train
+  - speed: default
+  - seed: default
+  - logger: offline
+  - _self_
+
+hydra:
+  run:
+    dir: "outputs/${exp.name}/${modes.mode}/${now:%Y%m%d_%H%M%S}"
+  output_subdir: null
+
+exp:
+  name: "cifar10_train"
+  desc: "CIFAR-10 supervised training"
+  tags: ["sl", "cifar10", "resnet50"]
+  notes: ""

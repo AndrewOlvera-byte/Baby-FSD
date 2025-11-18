@@ -1,0 +1,25 @@
+name: bc
+batch_size: 32
+epochs: 100
+
+optimizer:
+  name: adamw
+  lr: 3.0e-4
+  weight_decay: 0.01
+
+lr_scheduler:
+  name: cosine
+  warmup: 1000
+
+max_grad_norm: 1.0
+
+loader:
+  num_workers: 8
+  prefetch_factor: 4
+  persistent_workers: true
+  pin_memory: true
+
+# Loss weights
+loss_waypoint_weight: 1.0
+loss_speed_weight: 0.1
+

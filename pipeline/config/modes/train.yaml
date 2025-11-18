@@ -1,0 +1,3 @@
+mode: "train"
+logger:
+  log_interval: 100

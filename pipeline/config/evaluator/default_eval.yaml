@@ -1,0 +1,4 @@
+evaluator:
+  name: "default_eval"
+  episodes: 5
+  deterministic: true

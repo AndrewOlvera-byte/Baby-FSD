@@ -1,0 +1,4 @@
+mode: "eval"
+logger:
+  log_interval: 100
+

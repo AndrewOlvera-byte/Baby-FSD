@@ -3,3 +3,16 @@
 /data/__pycache__
 /collect/__pycache__
 /tests/__pycache__
+/pipeline/scripts/__pycache__
+/pipeline/src/__pycache__
+/pipeline/src/components/__pycache__
+/pipeline/src/components/collectors/__pycache__
+/pipeline/src/components/datasets/__pycache__
+/pipeline/src/components/datacolls/__pycache__
+/pipeline/src/components/envs/__pycache__
+/pipeline/src/components/evaluators/__pycache__
+/pipeline/src/components/losses/__pycache__
+/pipeline/src/components/loggers/__pycache__
+/pipeline/src/components/models/__pycache__
+/pipeline/src/components/optimizers/__pycache__
+*.pyc

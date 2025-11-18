@@ -1,0 +1,4 @@
+evaluator:
+  name: sl_classification
+  split: valid
+
