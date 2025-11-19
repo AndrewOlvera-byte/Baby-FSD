@@ -21,6 +21,8 @@ import carla
 
 from data.schema import Schemas, K_ROUTE_POINTS, N_FUTURE_STEPS, FIXED_DELTA_SECONDS, FUTURE_DELTA_SECONDS, ACTOR_RADIUS_METERS, WINDOW_METERS
 from data.writer import ParquetShardWriter, ParquetDatasetWriter, DuckDBWriter, table_from_pydict
+from data.hdf5_writer import HDF5EpisodeSetWriter
+from data.norms import normalize_ego_vector
 from carla_utils.route import (
     map_cmd_and_route,
     distance_to_goal,
@@ -144,6 +146,99 @@ def write_meta(out_dir: str, meta: Dict) -> None:
         json.dump(meta, f, indent=2)
 
 
+def build_hdf5_frame(rec: Dict, wp_future: List, vel_future: List, K: int, N: int, M: int) -> Dict:
+    """
+    Build a single frame dict for HDF5 output.
+    
+    Args:
+        rec: Raw frame record with ego state, BEV, route, etc.
+        wp_future: Future waypoints (N, 2)
+        vel_future: Future speeds (N,)
+        K: Number of route points
+        N: Number of future steps
+        M: Maximum number of objects
+        
+    Returns:
+        Dict with normalized arrays ready for HDF5 writing
+    """
+    from types import SimpleNamespace
+    
+    # Build ego vector (14-D normalized)
+    ego_row = SimpleNamespace(
+        speed_mps=rec["speed_mps"],
+        yaw_rate=rec["yaw_rate"],
+        accel_long=rec["accel_long"],
+        accel_lat=rec["accel_lat"],
+        curvature=rec["curvature"],
+        steer_angle_rad=rec["steer_angle_rad"],
+        steer_norm=rec["steer_norm"],
+        throttle=rec["throttle"],
+        brake=rec["brake"],
+        speed_limit_mps=rec["speed_limit_mps"],
+        command=rec["command"],
+        gear=rec["gear"],
+        time_of_day_sin=rec["time_of_day_sin"],
+        time_of_day_cos=rec["time_of_day_cos"],
+    )
+    ego_vec = normalize_ego_vector(ego_row).numpy()
+    
+    # BEV tensor - decode from bytes
+    bev_bytes = rec["bev_bytes"]
+    raw = zlib.decompress(bev_bytes)
+    bev_arr = np.load(io.BytesIO(raw), allow_pickle=False).astype(np.float32)
+    
+    # Route points - pad/truncate to K
+    route_xy = rec["route_xy"]
+    route_arr = np.zeros((K, 2), dtype=np.float32)
+    for i, (x, y) in enumerate(route_xy[:K]):
+        route_arr[i] = [x, y]
+    
+    # Object tokens - pad/truncate to M
+    actors_list = rec["actors"]
+    objects_arr = np.zeros((M, 11), dtype=np.float32)
+    object_mask = np.zeros((M,), dtype=np.float32)
+    for i, actor in enumerate(actors_list[:M]):
+        # Build object token vector
+        yaw_rad = np.radians(actor["yaw"])
+        objects_arr[i] = [
+            actor["type_id"],
+            actor["x_ego"],
+            actor["y_ego"],
+            np.sin(yaw_rad),
+            np.cos(yaw_rad),
+            actor["length"],
+            actor["width"],
+            actor["vx"],
+            actor["vy"],
+            actor.get("oncoming_flag", 0),
+            actor.get("priority_flag", 0),
+        ]
+        object_mask[i] = 1.0
+    
+    # Future waypoints and speeds - pad/truncate to N
+    future_xy = np.zeros((N, 2), dtype=np.float32)
+    future_v = np.zeros((N,), dtype=np.float32)
+    future_mask = np.zeros((N,), dtype=np.float32)
+    
+    n_futures = min(len(wp_future), N)
+    for i in range(n_futures):
+        future_xy[i] = wp_future[i]
+        future_v[i] = vel_future[i]
+        future_mask[i] = 1.0
+    
+    return {
+        "frame_id": rec["frame_id"],
+        "ego_vec": ego_vec,
+        "bev": bev_arr,
+        "route": route_arr,
+        "objects": objects_arr,
+        "object_mask": object_mask,
+        "future_xy": future_xy,
+        "future_v": future_v,
+        "future_mask": future_mask,
+    }
+
+
 def load_config(path: str) -> Dict:
     with open(path, "r") as f:
         return yaml.safe_load(f)
@@ -220,10 +315,32 @@ def main():
 
     # Storage backend
     storage_cfg = cfg.get("storage", {}) or {}
-    backend = (storage_cfg.get("backend", "duckdb") or "duckdb").lower()
+    backend = (storage_cfg.get("backend", "hdf5") or "hdf5").lower()
 
     # Writers per table
-    if backend == "duckdb":
+    if backend == "hdf5":
+        # HDF5 writer (v2, optimized)
+        episodes_per_set = int(storage_cfg.get("episodes_per_set", 5))
+        compression = storage_cfg.get("compression", "lz4")
+        chunk_size = int(storage_cfg.get("chunk_size", 100))
+        
+        run_id = os.path.basename(run_dir)
+        hdf5_writer = HDF5EpisodeSetWriter(
+            output_dir=run_dir,
+            run_id=run_id,
+            episodes_per_set=episodes_per_set,
+            K=K,
+            N_future=N,
+            M=64,  # max_objects
+            C=18,
+            H=int((bev_my * 2) / bev_res),  # BEV height
+            W=int((bev_mx * 2) / bev_res),  # BEV width
+            compression=compression,
+            chunk_size=chunk_size,
+        )
+        LOG.info("Using HDF5 backend (v2) with %d episodes per set, %s compression", episodes_per_set, compression)
+        frames_w = route_w = actors_w = tls_w = maps_w = fut_w = obj_w = bev_w = None
+    elif backend == "duckdb":
         db_path = os.path.join(run_dir, "bc.duckdb")
         frames_w = DuckDBWriter(run_dir, "frames", Schemas.FRAMES, db_path)
         route_w = DuckDBWriter(run_dir, "route_points", Schemas.ROUTE_POINTS, db_path)
@@ -500,6 +617,11 @@ def main():
             horizon_s = N * future_dt
             frames_written = 0
             frames_skipped = 0
+            
+            # For HDF5, batch episode frames
+            if backend == "hdf5":
+                episode_frames = []
+            
             while pending:
                 rec = pending.popleft()
                 # Check if we have enough future data
@@ -515,6 +637,16 @@ def main():
                 base_tf = rec["ego_tf"]
                 wp_future, vel_future = future_waypoints_ego(base_tf, samples)
 
+                # HDF5 backend: batch frames for episode-level write
+                if backend == "hdf5":
+                    frame_dict = build_hdf5_frame(rec, wp_future, vel_future, K, N, 64)
+                    episode_frames.append(frame_dict)
+                    frames_written += 1
+                    if frames_written % 100 == 0:
+                        LOG.info("    Progress: %d frames processed...", frames_written)
+                    continue
+                
+                # Legacy Parquet/DuckDB backends below
                 # Frames row
                 cur_goal_dist = rec.get("goal_dist_m", None)
                 if cur_goal_dist is None:
@@ -757,6 +889,11 @@ def main():
                 if frames_written % 100 == 0:
                     LOG.info("    Progress: %d frames written...", frames_written)
             
+            # For HDF5: write episode batch
+            if backend == "hdf5" and episode_frames:
+                hdf5_writer.append_episode(episode_frames)
+                frames_rows += len(episode_frames)
+            
             LOG.info("=== Episode %d/%d: Complete (%d frames written, %d skipped) ===", ep + 1, episodes, frames_written, frames_skipped)
 
         # (Writers closed in finally)
@@ -788,7 +925,10 @@ def main():
         
         # Finalize writers AFTER export (for DuckDB) or immediately (for other backends)
         try:
-            frames_w.close(); route_w.close(); actors_w.close(); tls_w.close(); maps_w.close(); fut_w.close(); obj_w.close(); bev_w.close()
+            if backend == "hdf5":
+                hdf5_writer.close()
+            else:
+                frames_w.close(); route_w.close(); actors_w.close(); tls_w.close(); maps_w.close(); fut_w.close(); obj_w.close(); bev_w.close()
         except Exception as e:
             LOG.warning("Error closing writers: %s", e)
         # Cleanup NPCs and ego

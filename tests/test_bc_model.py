@@ -1,7 +1,7 @@
 """
 Test script for BCPolicy model.
 
-Run from pipeline directory: python test_bc_model.py
+Run from project root: pytest tests/test_bc_model.py
 
 Verifies:
 - Model instantiation
@@ -11,10 +11,23 @@ Verifies:
 """
 
 import sys
-sys.path.insert(0, 'src')
+import os
 
-import torch
-from components.models.bc_policy import BCPolicy
+# Temporarily change to pipeline directory to make imports work like normal pipeline execution
+original_cwd = os.getcwd()
+pipeline_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'pipeline')
+os.chdir(pipeline_dir)
+
+try:
+    # Bootstrap the pipeline registry first
+    from src.core.bootstrap import bootstrap
+    bootstrap()
+
+    import torch
+    from components.models.bc_policy import BCPolicy
+finally:
+    # Always restore original directory
+    os.chdir(original_cwd)
 
 
 def test_bc_policy():

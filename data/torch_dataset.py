@@ -1,24 +1,23 @@
 """
-PyTorch Dataset and DataLoader for BC trajectories.
+PyTorch Dataset and DataLoader for BC trajectories with HDF5+LZ4 backend.
 
-Loads multi-table Parquet data and provides batched samples for training.
-Includes normalization, object tokens, and future masking.
-
-OPTIMIZED: Uses lazy loading to avoid loading entire dataset into memory at init.
+Optimized for high-throughput training with lazy loading and efficient random access.
 """
 
-import io
 import os
-import zlib
+import glob
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import pyarrow as pa
-import pyarrow.compute as pc
-import pyarrow.dataset as ds
-import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset
+
+try:
+    import h5py
+    HDF5_AVAILABLE = True
+except ImportError:
+    HDF5_AVAILABLE = False
+    h5py = None
 
 from data.norms import (
     normalize_ego_vector,
@@ -32,7 +31,7 @@ from data.transforms import BCTransform
 
 class BCTrajectoryDataset(Dataset):
     """
-    PyTorch Dataset for BC trajectories from Parquet files.
+    PyTorch Dataset for BC trajectories from HDF5 episode-set files.
     
     Each sample returns normalized observations and labels:
         - ego_vec: (d_ego,) ego state vector
@@ -51,22 +50,25 @@ class BCTrajectoryDataset(Dataset):
         future_horizon: int = 12,
         route_points: int = 32,
         max_objects: int = 64,
-        use_bev_mmap: bool = True,
         augment: bool = False,
         split: str = "all",     # "train", "val", "all"
         val_ratio: float = 0.2,
+        use_bev_mmap: bool = False,  # Ignored, kept for API compatibility
     ):
         """
         Args:
-            run_dir: Path to BC run directory (contains frames/, bev_frames/, etc.)
+            run_dir: Path to BC run directory (contains .h5 episode-set files)
             future_horizon: Number of future waypoints (N)
             route_points: Number of route points (K)
             max_objects: Maximum number of object tokens (M)
-            use_bev_mmap: If True, use pre-computed memory-mapped BEV file for fast loading
             augment: Whether to apply data augmentation
             split: Split type ("train", "val", "all")
             val_ratio: Fraction of data to use for validation (if split is not "all")
+            use_bev_mmap: Ignored (kept for backward compatibility)
         """
+        if not HDF5_AVAILABLE:
+            raise ImportError("h5py is required for HDF5 dataset")
+        
         self.run_dir = os.path.abspath(run_dir)
         self.future_horizon = future_horizon
         self.route_points = route_points
@@ -74,192 +76,101 @@ class BCTrajectoryDataset(Dataset):
         self.augment = augment
         self.transform = BCTransform(augment=augment)
         
-        # Paths to data tables
-        frames_path = os.path.join(self.run_dir, "frames")
-        futures_path = os.path.join(self.run_dir, "futures")
-        route_path = os.path.join(self.run_dir, "route_points")
-        bev_path = os.path.join(self.run_dir, "bev_frames")
-        objects_path = os.path.join(self.run_dir, "object_tokens")
+        print(f"[BCTrajectoryDataset] Initializing HDF5-backed dataset from {run_dir}")
         
-        # Check required tables exist
-        required_paths = [frames_path, futures_path, route_path, bev_path]
-        if not all(os.path.isdir(p) for p in required_paths):
-            raise FileNotFoundError(f"Missing required tables in {run_dir}")
+        # Find all HDF5 episode-set files
+        h5_files = sorted(glob.glob(os.path.join(self.run_dir, "*.h5")))
         
-        # LAZY LOADING: Keep datasets as PyArrow datasets (don't convert to pandas)
-        print(f"[BCTrajectoryDataset] Initializing lazy-loading dataset from {run_dir}")
+        if not h5_files:
+            raise FileNotFoundError(f"No HDF5 files found in {run_dir}")
         
-        # Check for cached index file
-        index_cache_path = os.path.join(self.run_dir, ".frame_index_cache.npy")
+        print(f"[BCTrajectoryDataset] Found {len(h5_files)} HDF5 episode-set files")
         
-        if os.path.exists(index_cache_path):
-            # Load pre-computed frame IDs (instant)
-            print("[BCTrajectoryDataset] Loading cached frame index...")
-            self._frame_ids = np.load(index_cache_path).tolist()
-            print(f"[BCTrajectoryDataset] Loaded {len(self._frame_ids)} frames from cache (instant)")
-        else:
-            # Build frame index with parallel scanning
-            print("[BCTrajectoryDataset] Building frame index (first time only)...")
-            import multiprocessing as mp
-            n_cores = min(8, mp.cpu_count())
-            
-            # Use PyArrow dataset with parallel fragment scanning
-            self._frame_ids = self._build_frame_index_parallel(frames_path, n_cores)
-            
-            # Cache the frame IDs for next time
-            print(f"[BCTrajectoryDataset] Caching frame index to {index_cache_path}")
-            np.save(index_cache_path, np.array(self._frame_ids, dtype=np.int64))
-            print(f"[BCTrajectoryDataset] Found {len(self._frame_ids)} frames (cached for future runs)")
+        # Build global index: map global_idx -> (file_idx, local_idx)
+        self._file_paths = h5_files
+        self._file_lengths = []
+        self._file_cumsum = [0]
+        
+        for fpath in h5_files:
+            with h5py.File(fpath, "r") as f:
+                n_samples = len(f["frame_id"])
+                self._file_lengths.append(n_samples)
+                self._file_cumsum.append(self._file_cumsum[-1] + n_samples)
+        
+        self._total_samples = self._file_cumsum[-1]
+        
+        print(f"[BCTrajectoryDataset] Total samples across all files: {self._total_samples:,}")
         
         # Apply train/val split
         if split != "all":
-            n_frames = len(self._frame_ids)
-            split_idx = int(n_frames * (1 - val_ratio))
+            split_idx = int(self._total_samples * (1 - val_ratio))
             
             if split == "train":
-                self._frame_ids = self._frame_ids[:split_idx]
-                print(f"[BCTrajectoryDataset] Split 'train': Using first {len(self._frame_ids)}/{n_frames} frames")
+                self._start_idx = 0
+                self._end_idx = split_idx
+                print(f"[BCTrajectoryDataset] Split 'train': Using samples [0, {split_idx})")
             elif split == "val":
-                self._frame_ids = self._frame_ids[split_idx:]
-                print(f"[BCTrajectoryDataset] Split 'val': Using last {len(self._frame_ids)}/{n_frames} frames")
-        
-        # Check for pre-computed BEV memory-map (Phase 2 optimization)
-        mmap_path = os.path.join(self.run_dir, "bevs.mmap")
-        bev_index_path = os.path.join(self.run_dir, "frame_id_index.npy")
-        
-        if use_bev_mmap and os.path.exists(mmap_path) and os.path.exists(bev_index_path):
-            print("[BCTrajectoryDataset] ✓ Using pre-computed BEV memory-map (100-1000× faster loading)")
-            self._use_bev_mmap = True
-            
-            # Load BEV frame ID index
-            bev_frame_ids = np.load(bev_index_path)
-            self._bev_frame_id_to_idx = {int(fid): idx for idx, fid in enumerate(bev_frame_ids)}
-            
-            # Open memory-mapped file in read-only mode
-            # Shape is inferred from file size (N, 18, 150, 200)
-            total_elements = os.path.getsize(mmap_path) // 4  # 4 bytes per float32
-            N = total_elements // (18 * 150 * 200)
-            self._bev_mmap = np.memmap(mmap_path, dtype='float32', mode='r', shape=(N, 18, 150, 200))
-            print(f"[BCTrajectoryDataset]   BEV mmap shape: {self._bev_mmap.shape}, size: {os.path.getsize(mmap_path) / 1e9:.2f} GB")
-            
-            # Don't load BEV dataset from parquet
-            self._bev_dataset = None
+                self._start_idx = split_idx
+                self._end_idx = self._total_samples
+                print(f"[BCTrajectoryDataset] Split 'val': Using samples [{split_idx}, {self._total_samples})")
         else:
-            self._use_bev_mmap = False
-            self._bev_mmap = None
-            self._bev_frame_id_to_idx = {}
-            
-            if use_bev_mmap:
-                print("[BCTrajectoryDataset] ⚠ BEV memory-map not found, using parquet (slower)")
-                print(f"[BCTrajectoryDataset]   Run 'python tools/preprocess_bev_mmap.py {self.run_dir}' to generate mmap")
-            
-            # Load BEV dataset from parquet
-            self._bev_dataset = ds.dataset(bev_path, format="parquet")
+            self._start_idx = 0
+            self._end_idx = self._total_samples
         
-        # Now load other datasets (this is fast, just creates references)
-        self._frames_dataset = ds.dataset(frames_path, format="parquet")
-        self._futures_dataset = ds.dataset(futures_path, format="parquet")
-        self._route_dataset = ds.dataset(route_path, format="parquet")
+        # File handles (opened lazily per worker)
+        self._file_handles: Optional[List[h5py.File]] = None
         
-        # Check if objects exist
-        self._has_objects = os.path.isdir(objects_path)
-        if self._has_objects:
-            self._objects_dataset = ds.dataset(objects_path, format="parquet")
-        
-        # Cache for frequently accessed data (optional, can help with repeated access)
-        self._cache_size = 1000
-        self._frames_cache = {}
-        self._bev_cache = {}
-        self._route_cache = {}
-        self._futures_cache = {}
-        self._objects_cache = {}
-        
-        # Phase 2.2 optimization: Pre-build frame ID set for faster existence checks
-        self._frame_id_set = set(self._frame_ids)
-        print(f"[BCTrajectoryDataset] Frame ID index ready: {len(self._frame_id_set):,} unique frames")
+        print(f"[BCTrajectoryDataset] Dataset ready: {len(self)} samples")
     
-    def _build_frame_index_parallel(self, frames_path: str, n_cores: int) -> List[int]:
-        """
-        Build frame index using parallel processing.
-        Scans Parquet files in parallel to extract frame_ids quickly.
-        Uses ThreadPoolExecutor for I/O-bound Parquet reading (faster than ProcessPool).
-        """
-        import glob
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        
-        # Get all parquet files
-        parquet_files = sorted(glob.glob(os.path.join(frames_path, "*.parquet")))
-        print(f"[BCTrajectoryDataset] Scanning {len(parquet_files)} Parquet files using {n_cores} threads...")
-        
-        def read_frame_ids(file_path):
-            """Read frame_ids from a single parquet file."""
-            try:
-                table = pq.read_table(file_path, columns=["frame_id"])
-                return table["frame_id"].to_pylist()
-            except Exception as e:
-                print(f"Warning: Failed to read {file_path}: {e}")
-                return []
-        
-        # Parallel processing with threads (better for I/O)
-        all_frame_ids = []
-        with ThreadPoolExecutor(max_workers=n_cores) as executor:
-            futures = {executor.submit(read_frame_ids, f): f for f in parquet_files}
-            
-            completed = 0
-            for future in as_completed(futures):
-                frame_ids = future.result()
-                all_frame_ids.extend(frame_ids)
-                completed += 1
-                if completed % 1000 == 0:
-                    print(f"  Processed {completed}/{len(parquet_files)} files...")
-        
-        # Sort and return
-        print("[BCTrajectoryDataset] Sorting frame IDs...")
-        return sorted(all_frame_ids)
+    def _ensure_files_open(self):
+        """Lazily open HDF5 files (once per worker process)."""
+        if self._file_handles is None:
+            self._file_handles = []
+            for fpath in self._file_paths:
+                f = h5py.File(fpath, "r")
+                self._file_handles.append(f)
+    
+    def _global_to_local(self, global_idx: int) -> Tuple[int, int]:
+        """Convert global index to (file_idx, local_idx)."""
+        # Binary search in cumsum
+        file_idx = np.searchsorted(self._file_cumsum, global_idx, side="right") - 1
+        local_idx = global_idx - self._file_cumsum[file_idx]
+        return file_idx, local_idx
     
     def __len__(self) -> int:
-        return len(self._frame_ids)
+        return self._end_idx - self._start_idx
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Get a single normalized sample (lazy loaded)."""
-        frame_id = self._frame_ids[idx]
+        """Get a single normalized sample (lazy loaded from HDF5)."""
+        # Adjust for split offset
+        global_idx = self._start_idx + idx
         
-        # Get frame data (ego state) - lazy load with caching
-        if frame_id not in self._frames_cache:
-            frame_filter = pc.field("frame_id") == frame_id
-            frame_table = self._frames_dataset.to_table(filter=frame_filter)
-            if len(frame_table) == 0:
-                raise ValueError(f"Frame {frame_id} not found in frames table")
-            # Store as dict for normalize_ego_vector compatibility
-            row_dict = {col: frame_table[col][0].as_py() for col in frame_table.column_names}
-            self._frames_cache[frame_id] = row_dict
-            # Simple LRU: clear cache if too large
-            if len(self._frames_cache) > self._cache_size:
-                # Remove oldest 20% of entries
-                to_remove = list(self._frames_cache.keys())[: self._cache_size // 5]
-                for k in to_remove:
-                    del self._frames_cache[k]
+        # Open files if not already open
+        self._ensure_files_open()
         
-        row = self._frames_cache[frame_id]
+        # Map to file and local index
+        file_idx, local_idx = self._global_to_local(global_idx)
+        f = self._file_handles[file_idx]
         
-        # Ego vector (normalized)
-        ego_vec = self._normalize_ego_from_dict(row)
+        # Read all data for this sample from HDF5
+        # Note: HDF5 stores raw unnormalized data, so we normalize here
+        frame_id = int(f["frame_id"][local_idx])
+        ego_vec = torch.from_numpy(f["ego_vec"][local_idx].astype(np.float32))
+        bev = torch.from_numpy(f["bev"][local_idx].astype(np.float32))
+        route = torch.from_numpy(f["route"][local_idx].astype(np.float32))
+        objects = torch.from_numpy(f["objects"][local_idx].astype(np.float32))
+        object_mask = torch.from_numpy(f["object_mask"][local_idx].astype(np.float32))
+        future_xy = torch.from_numpy(f["future_xy"][local_idx].astype(np.float32))
+        future_v = torch.from_numpy(f["future_v"][local_idx].astype(np.float32))
+        future_mask = torch.from_numpy(f["future_mask"][local_idx].astype(np.float32))
         
-        # BEV tensor (normalized) - lazy load
-        bev = self._get_bev_lazy(frame_id)
+        # Normalize all features
+        # Note: HDF5 stores raw data, apply normalization
+        ego_vec = ego_vec  # Already normalized during collection
         bev = normalize_bev(bev)
-        
-        # Route points (normalized) - lazy load
-        route = self._get_route_lazy(frame_id)
         route = normalize_route_points(route)
-        
-        # Object tokens (normalized) + mask - lazy load
-        objects, object_mask = self._get_objects_lazy(frame_id)
         objects = normalize_object_tokens(objects)
-        
-        # Future waypoints and speeds (normalized) + mask - lazy load
-        futures_xy, futures_speed, future_mask = self._get_futures_lazy(frame_id)
-        futures_xy, futures_speed = normalize_futures(futures_xy, futures_speed)
+        future_xy, future_v = normalize_futures(future_xy, future_v)
         
         sample = {
             "frame_id": frame_id,
@@ -270,8 +181,8 @@ class BCTrajectoryDataset(Dataset):
             "objects": objects,          # (M, d_obj)
             "object_mask": object_mask,  # (M,)
             # Labels (normalized)
-            "future_xy": futures_xy,     # (N, 2)
-            "future_v": futures_speed,   # (N,)
+            "future_xy": future_xy,      # (N, 2)
+            "future_v": future_v,        # (N,)
             "future_mask": future_mask,  # (N,)
         }
 
@@ -280,193 +191,14 @@ class BCTrajectoryDataset(Dataset):
 
         return sample
     
-    def _normalize_ego_from_dict(self, row_dict: Dict) -> torch.Tensor:
-        """
-        Normalize ego vector from dict (compatible with normalize_ego_vector).
-        Creates a simple namespace object to match pandas row interface.
-        """
-        from types import SimpleNamespace
-        row = SimpleNamespace(**row_dict)
-        return normalize_ego_vector(row)
-    
-    def _get_bev_lazy(self, frame_id: int) -> torch.Tensor:
-        """Lazy load BEV tensor for a single frame."""
-        if frame_id in self._bev_cache:
-            return self._bev_cache[frame_id]
-        
-        if self._use_bev_mmap:
-            # Fast path: Instant lookup from memory-mapped file (100-1000× faster)
-            idx = self._bev_frame_id_to_idx.get(frame_id)
-            if idx is not None:
-                # Direct array access from mmap (no decompression needed)
-                bev = torch.from_numpy(self._bev_mmap[idx].copy())
-            else:
-                # Frame not found in mmap, return zeros
-                bev = torch.zeros((18, 150, 200), dtype=torch.float32)
-        else:
-            # Slow path: Load from parquet and decompress (legacy support)
-            bev_filter = pc.field("frame_id") == frame_id
-            bev_table = self._bev_dataset.to_table(filter=bev_filter, columns=["frame_id", "data"])
-            
-            if len(bev_table) == 0:
-                # Return empty BEV if missing
-                bev = torch.zeros((18, 150, 200), dtype=torch.float32)
-            else:
-                blob = bev_table["data"][0].as_py()
-                raw = zlib.decompress(blob)
-                arr = np.load(io.BytesIO(raw), allow_pickle=False)
-                bev = torch.from_numpy(arr.astype(np.float32))
-        
-        # Cache it
-        self._bev_cache[frame_id] = bev
-        if len(self._bev_cache) > self._cache_size:
-            to_remove = list(self._bev_cache.keys())[: self._cache_size // 5]
-            for k in to_remove:
-                del self._bev_cache[k]
-        
-        return bev
-    
-    def _get_route_lazy(self, frame_id: int) -> torch.Tensor:
-        """Lazy load route points for a single frame."""
-        if frame_id in self._route_cache:
-            return self._route_cache[frame_id]
-        
-        # Filter and load only this frame's route
-        route_filter = pc.field("frame_id") == frame_id
-        route_table = self._route_dataset.to_table(filter=route_filter)
-        
-        # Convert to list and sort by idx
-        route_list = []
-        if len(route_table) > 0:
-            df = route_table.to_pandas().sort_values("idx")
-            route_list = [(float(row.x_ego), float(row.y_ego)) for row in df.itertuples(index=False)]
-        
-        # Pad or truncate to K points
-        route = np.zeros((self.route_points, 2), dtype=np.float32)
-        for i, (x, y) in enumerate(route_list[:self.route_points]):
-            route[i] = [x, y]
-        
-        route_tensor = torch.from_numpy(route)
-        
-        # Cache it
-        self._route_cache[frame_id] = route_tensor
-        if len(self._route_cache) > self._cache_size:
-            to_remove = list(self._route_cache.keys())[: self._cache_size // 5]
-            for k in to_remove:
-                del self._route_cache[k]
-        
-        return route_tensor
-    
-    def _get_futures_lazy(self, frame_id: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Lazy load future waypoints and speeds for a single frame."""
-        if frame_id in self._futures_cache:
-            return self._futures_cache[frame_id]
-        
-        # Filter and load only this frame's futures
-        futures_filter = pc.field("frame_id") == frame_id
-        futures_table = self._futures_dataset.to_table(filter=futures_filter)
-        
-        # Convert to list and sort by i
-        futures_list = []
-        if len(futures_table) > 0:
-            df = futures_table.to_pandas().sort_values("i")
-            futures_list = [
-                (float(row.x_ego), float(row.y_ego), float(row.v_mps))
-                for row in df.itertuples(index=False)
-            ]
-        
-        # Pad or truncate to N steps
-        futures_xy = np.zeros((self.future_horizon, 2), dtype=np.float32)
-        futures_speed = np.zeros((self.future_horizon,), dtype=np.float32)
-        future_mask = np.zeros((self.future_horizon,), dtype=np.float32)
-        
-        # Fill valid futures
-        n_futures = min(len(futures_list), self.future_horizon)
-        for i in range(n_futures):
-            x, y, v = futures_list[i]
-            futures_xy[i] = [x, y]
-            futures_speed[i] = v
-            future_mask[i] = 1.0  # Valid future
-        
-        result = (
-            torch.from_numpy(futures_xy),
-            torch.from_numpy(futures_speed),
-            torch.from_numpy(future_mask),
-        )
-        
-        # Cache it
-        self._futures_cache[frame_id] = result
-        if len(self._futures_cache) > self._cache_size:
-            to_remove = list(self._futures_cache.keys())[: self._cache_size // 5]
-            for k in to_remove:
-                del self._futures_cache[k]
-        
-        return result
-    
-    def _get_objects_lazy(self, frame_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Lazy load object tokens for a single frame."""
-        if frame_id in self._objects_cache:
-            return self._objects_cache[frame_id]
-        
-        objects_list = []
-        if self._has_objects:
-            # Filter and load only this frame's objects
-            objects_filter = pc.field("frame_id") == frame_id
-            objects_table = self._objects_dataset.to_table(filter=objects_filter)
-            
-            # Convert to list and sort by idx
-            if len(objects_table) > 0:
-                df = objects_table.to_pandas().sort_values("idx")
-                for row in df.itertuples(index=False):
-                    obj = {
-                        "type_id": int(row.type_id),
-                        "x_ego": float(row.x_ego),
-                        "y_ego": float(row.y_ego),
-                        "sin_yaw": float(row.sin_yaw),
-                        "cos_yaw": float(row.cos_yaw),
-                        "length": float(row.length),
-                        "width": float(row.width),
-                        "vx": float(row.vx),
-                        "vy": float(row.vy),
-                        "oncoming_flag": int(row.oncoming_flag),
-                        "priority_flag": int(row.priority_flag),
-                    }
-                    objects_list.append(obj)
-        
-        # Initialize padded arrays
-        tokens = np.zeros((self.max_objects, 11), dtype=np.float32)
-        mask = np.zeros((self.max_objects,), dtype=np.float32)
-        
-        # Fill valid objects
-        n_objects = min(len(objects_list), self.max_objects)
-        for i in range(n_objects):
-            obj = objects_list[i]
-            tokens[i] = [
-                obj["type_id"],
-                obj["x_ego"],
-                obj["y_ego"],
-                obj["sin_yaw"],
-                obj["cos_yaw"],
-                obj["length"],
-                obj["width"],
-                obj["vx"],
-                obj["vy"],
-                obj["oncoming_flag"],
-                obj["priority_flag"],
-            ]
-            mask[i] = 1.0  # Valid object
-        
-        result = (torch.from_numpy(tokens), torch.from_numpy(mask))
-        
-        # Cache it
-        self._objects_cache[frame_id] = result
-        if len(self._objects_cache) > self._cache_size:
-            to_remove = list(self._objects_cache.keys())[: self._cache_size // 5]
-            for k in to_remove:
-                del self._objects_cache[k]
-        
-        return result
-    
+    def __del__(self):
+        """Close file handles on cleanup."""
+        if self._file_handles is not None:
+            for f in self._file_handles:
+                try:
+                    f.close()
+                except:
+                    pass
 
 
 def fast_collate_fn(batch):
@@ -496,7 +228,7 @@ def fast_collate_fn(batch):
     M = first["objects"].shape[0]
     N = first["future_xy"].shape[0]
     
-    # Pre-allocate output tensors (Phase 3 optimization)
+    # Pre-allocate output tensors
     ego_vec = torch.zeros((B, d_ego), dtype=torch.float32)
     bev = torch.zeros((B, C, H, W), dtype=torch.float32)
     route = torch.zeros((B, K, 2), dtype=torch.float32)
@@ -531,49 +263,33 @@ def fast_collate_fn(batch):
 
 def _worker_init_fn(worker_id):
     """
-    Initialize worker to reduce memory footprint.
+    Initialize worker for HDF5 file access.
     
-    This function is called in each DataLoader worker process to:
-    - Reduce cache sizes to avoid OOM (split cache across workers)
-    - Set memory limits for PyArrow to prevent leaks
-    - Clear existing caches to free memory
+    Each worker process opens its own HDF5 file handles to avoid
+    thread-safety issues with h5py.
     
     Args:
         worker_id: Worker process ID (0 to num_workers-1)
     """
-    import pyarrow as pa
+    import torch.utils.data
     
     # Get worker info and dataset
     worker_info = torch.utils.data.get_worker_info()
     if worker_info is not None:
         dataset = worker_info.dataset
         
-        # Reduce cache size per worker to avoid OOM
-        # With 2 workers and 200 cache each = 400 total vs 8 workers * 1000 = 8000 before
-        dataset._cache_size = 200  # Down from 1000
+        # Force lazy file opening in this worker
+        # HDF5 files will be opened on first __getitem__ call
+        dataset._file_handles = None
         
-        # Clear existing caches to free memory
-        dataset._frames_cache.clear()
-        dataset._bev_cache.clear()
-        dataset._route_cache.clear()
-        dataset._futures_cache.clear()
-        dataset._objects_cache.clear()
-        
-        print(f"[Worker {worker_id}] Initialized with cache_size={dataset._cache_size}")
-    
-    # Limit PyArrow memory pool to prevent unbounded growth
-    # This prevents memory leaks in long-running worker processes
-    try:
-        pa.set_memory_pool(pa.proxy_memory_pool(pa.default_memory_pool(), 512 * 1024 * 1024))  # 512 MB limit per worker
-    except Exception as e:
-        print(f"[Worker {worker_id}] Warning: Could not set PyArrow memory limit: {e}")
+        print(f"[Worker {worker_id}] Initialized for HDF5 access")
 
 
 def create_bc_dataloader(
     run_dir: str,
     batch_size: int = 32,
     shuffle: bool = True,
-    num_workers: int = 8,
+    num_workers: int = 4,
     prefetch_factor: int = 4,
     persistent_workers: bool = True,
     pin_memory: bool = True,
@@ -581,20 +297,20 @@ def create_bc_dataloader(
     future_horizon: int = 12,
     route_points: int = 32,
     max_objects: int = 64,
-    use_bev_mmap: bool = True,
+    use_bev_mmap: bool = False,  # Ignored
     augment: bool = False,
     split: str = "all",
     val_ratio: float = 0.2,
     **kwargs
 ) -> torch.utils.data.DataLoader:
     """
-    Create an optimized PyTorch DataLoader for BC trajectories.
+    Create an optimized PyTorch DataLoader for BC trajectories (HDF5 backend).
     
     Args:
         run_dir: Path to BC run directory
         batch_size: Batch size
         shuffle: Whether to shuffle data
-        num_workers: Number of worker processes for data loading (default: 8)
+        num_workers: Number of worker processes for data loading (default: 4)
         prefetch_factor: Batches to prefetch per worker (default: 4)
         persistent_workers: Keep workers alive between epochs (default: True)
         pin_memory: Pin memory for faster GPU transfer (default: True)
@@ -602,7 +318,7 @@ def create_bc_dataloader(
         future_horizon: Number of future waypoints (N)
         route_points: Number of route points (K)
         max_objects: Maximum number of object tokens (M)
-        use_bev_mmap: If True, use pre-computed memory-mapped BEV file (default: True)
+        use_bev_mmap: Ignored (legacy parameter)
         augment: If True, apply data augmentation to the dataset.
         split: Dataset split ("train", "val", "all")
         val_ratio: Fraction of data to use for validation
@@ -626,7 +342,7 @@ def create_bc_dataloader(
     )
     
     init_time = time.time() - start_time
-    print(f"[BCDataLoader] Dataset initialized in {init_time:.2f}s (lazy loading enabled)")
+    print(f"[BCDataLoader] Dataset initialized in {init_time:.2f}s (HDF5 lazy loading)")
     print(f"[BCDataLoader] Creating DataLoader: {len(dataset)} samples, batch_size={batch_size}, num_workers={num_workers}")
     
     # Persistent workers requires num_workers > 0
@@ -640,13 +356,13 @@ def create_bc_dataloader(
         "pin_memory": pin_memory,
         "drop_last": drop_last,
         "persistent_workers": persistent_workers,
-        "collate_fn": fast_collate_fn,  # Phase 3 optimization: faster batching
+        "collate_fn": fast_collate_fn,
     }
     
     # prefetch_factor only valid when num_workers > 0
     if num_workers > 0:
         dataloader_kwargs["prefetch_factor"] = prefetch_factor
-        # Add worker init function to reduce memory per worker
+        # Add worker init function for HDF5 file handle management
         dataloader_kwargs["worker_init_fn"] = _worker_init_fn
     
     # Merge any additional kwargs

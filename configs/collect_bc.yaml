@@ -4,7 +4,7 @@ port: 2000
 tm_port: 8000
 
 # Output
-out_dir: "data/BC_v1"
+out_dir: "data/BC_v2"  # v2 uses HDF5+LZ4 format
 
 # Sim timing
 fixed_dt: 0.05         # 20 Hz
@@ -28,7 +28,7 @@ behavior: "normal"     # cautious | normal | aggressive
 wheelbase_m: 2.875
 
 # Episodes and traffic
-episodes: 20
+episodes: 5
 episode_max_frames: 2000
 npc_count: 40
 
@@ -62,5 +62,8 @@ parquet:
 
 # Storage backend
 storage:
-  backend: parquet_dataset  # parquet_dataset (simple, robust) | duckdb (faster but complex)
+  backend: hdf5           # hdf5 (v2, optimized) | parquet_dataset (legacy) | duckdb (legacy)
+  episodes_per_set: 5     # Number of episodes per HDF5 file
+  compression: lz4        # lz4 (fast+small) | lzf (fast) | gzip (slower) | none
+  chunk_size: 100         # Chunk size along sample axis
 

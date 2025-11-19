@@ -1,8 +1,25 @@
+# Core Python dependencies
 pyarrow==12.0.1
 numpy==1.21.6
 PyYAML==6.0.1
 pandas==1.3.5
 duckdb==0.8.1
+
+# PyTorch ecosystem
 torch>=1.13.0
+torchvision>=0.14.0
+
+# Testing
 pytest>=7.0.0
+
+# HDF5 support (for BC v2 data format)
+h5py>=3.8.0
+hdf5plugin>=4.0.0
+
+# Progress bars
+tqdm>=4.65.0
+
+# External Dependencies (install separately):
+# - CARLA Simulator (https://carla.org/)
+# - Follow CARLA installation instructions for your platform
 

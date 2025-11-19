@@ -11,7 +11,11 @@ conda activate carla-env-3.7
 pip install -r requirements.txt
 ```
 
-2) Start CARLA server (e.g., Town10HD_Opt) on the same host/ports as in `configs/collect_bc.yaml`.
+2) Install CARLA Simulator (external dependency):
+   - Follow installation instructions at https://carla.org/
+   - Make sure CARLA Python API is available in your Python environment
+
+3) Start CARLA server (e.g., Town10HD_Opt) on the same host/ports as in `configs/collect_bc.yaml`.
 
 ### Quick visual sim check (BehaviorAgent + traffic + walkers)
 1) Start CARLA server on Town10HD_Opt (port 2000).
@@ -21,7 +25,7 @@ pip install -r requirements.txt
 python model3_visual_confirm_test.py --host 127.0.0.1 --port 2000 --tm-port 8000 --vehicles 50 --walkers 50 --behavior normal --timeout 300
 ```
 
-### Collect Behavior Cloning dataset (normalized Parquet, full obs/action schema)
+### Collect Behavior Cloning dataset (HDF5+LZ4, optimized for training throughput)
 1) Ensure CARLA is running (Town10HD_Opt).
 2) Run collector:
 
@@ -29,9 +33,14 @@ python model3_visual_confirm_test.py --host 127.0.0.1 --port 2000 --tm-port 8000
 python collect/collect_bc.py --config configs/collect_bc.yaml
 ```
 
-Output directory: `data/BC_v1/run-YYYYmmdd-HHMMSS/`
-- Parquet tables: `frames`, `route_points`, `actors`, `traffic_lights`, `map_segments`, `futures`, `object_tokens`, `bev_frames`
-- Configurable via `configs/collect_bc.yaml` (fixed_dt, future_dt, K route points, N futures, windows, shards, etc.)
+Output directory: `data/BC_v2/run-YYYYmmdd-HHMMSS/`
+- **HDF5 episode-set files** (v2, default): `run-*_setNNN.h5` with LZ4 compression
+  - Each file contains 5 episodes (configurable) with all frames flattened
+  - Direct random-access loading without preprocessing
+  - Optimized for 100% GPU utilization and maximum training throughput
+  - Significantly smaller disk footprint than Parquet+mmap
+- Legacy Parquet tables (v1, set `storage.backend: parquet_dataset`): `frames/`, `route_points/`, etc.
+- Configurable via `configs/collect_bc.yaml` (fixed_dt, future_dt, K route points, N futures, windows, compression, etc.)
 
 Obs/action mapping for BC:
 - Obs
@@ -86,6 +95,18 @@ Prints shapes for:
 - `route_poly` (R, d_route) containing x,y,dx,dy,curvature,s_frac
 - `object_tokens` (M, d_obj) + `object_mask` (M,)
 - `future_waypoints` (N,2) and `future_speeds` (N,)
+
+## Testing
+
+See `TESTING.md` for complete testing instructions.
+
+**Quick test run:**
+```bash
+conda activate carla-env-3.7
+pip install -r requirements.txt
+pip install -r pipeline/requirements.txt
+pytest tests/ -v
+```
 
 ### Notes on routes and test-time evaluation
 - During collection, the expert agent is given a start and a goal; the route plan is sampled into `route_points` (ego-frame polyline) and rendered into BEV route channels.
