@@ -18,11 +18,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # deps first for build cache
-COPY requirements.txt /app/requirements.txt
-RUN pip install --upgrade pip && pip install -r /app/requirements.txt
+COPY pipeline/requirements.txt /app/pipeline/requirements.txt
+RUN pip install --upgrade pip && pip install -r /app/pipeline/requirements.txt
 
-# project code
+# project code (entire Baby-FSD root including data/ and pipeline/)
 COPY . /app
 
 # default command: training entry; Compose or CLI can override freely
-CMD ["python", "scripts/train.py"]
+CMD ["python", "pipeline/scripts/train.py"]

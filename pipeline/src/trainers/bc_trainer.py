@@ -90,6 +90,36 @@ class BCTrainer(BaseTrainer):
             self.optimizer = opt_factory().build(opt_cfg, {"model": self.model})
         else:
             self.optimizer = opt_factory(opt_cfg, {"model": self.model})
+        
+        # EMA (Exponential Moving Average) for stability
+        self.use_ema = bool(getattr(self.tr_cfg, "use_ema", True))
+        self.ema_decay = float(getattr(self.tr_cfg, "ema_decay", 0.9999))
+        if self.use_ema:
+            from copy import deepcopy
+            self.ema_model = deepcopy(self.model)
+            for param in self.ema_model.parameters():
+                param.requires_grad = False
+            print(f"[BCTrainer] Using EMA with decay={self.ema_decay}")
+        else:
+            self.ema_model = None
+        
+        # Gradient accumulation
+        self.gradient_accumulation_steps = int(getattr(self.tr_cfg, "gradient_accumulation_steps", 1))
+        if self.gradient_accumulation_steps > 1:
+            print(f"[BCTrainer] Using gradient accumulation with {self.gradient_accumulation_steps} steps")
+    
+    def _update_ema(self):
+        """Update EMA model parameters."""
+        if self.ema_model is None:
+            return
+        with torch.no_grad():
+            for ema_param, model_param in zip(
+                self.ema_model.parameters(), 
+                self.model.parameters()
+            ):
+                ema_param.data.mul_(self.ema_decay).add_(
+                    model_param.data, alpha=1.0 - self.ema_decay
+                )
     
     def _make_loaders(self) -> Dict[str, DataLoader]:
         """Create BC dataloaders from dataset config."""
@@ -142,9 +172,11 @@ class BCTrainer(BaseTrainer):
             future_horizon=future_horizon,
             route_points=route_points,
             max_objects=max_objects,
+            augment=True,
+            split="train",
+            val_ratio=0.2,
         )
         
-        # For now, use same data for validation (TODO: split dataset)
         valid_loader = create_bc_dataloader(
             run_dir=run_dir,
             batch_size=batch_size,
@@ -157,6 +189,9 @@ class BCTrainer(BaseTrainer):
             future_horizon=future_horizon,
             route_points=route_points,
             max_objects=max_objects,
+            augment=False,
+            split="val",
+            val_ratio=0.2,
         )
         
         return {"train": train_loader, "valid": valid_loader}
@@ -252,27 +287,45 @@ class BCTrainer(BaseTrainer):
                         losses = self.compute_loss(predictions, batch)
                         loss = losses["loss"]
                     
+                    # Store unscaled loss for logging
+                    unscaled_loss = loss.item()
+                    unscaled_waypoint_loss = losses["loss_waypoint"].item()
+                    unscaled_speed_loss = losses["loss_speed"].item()
+                    
+                    # Scale loss for gradient accumulation
+                    loss = loss / self.gradient_accumulation_steps
+                    
                     # Backward pass
-                    self.optimizer.zero_grad(set_to_none=True)
                     if scaler.is_enabled():
                         scaler.scale(loss).backward()
-                        self.clip_grad(self.model.parameters(), float(getattr(self.tr_cfg, "max_grad_norm", 0.0)))
-                        scaler.step(self.optimizer)
-                        scaler.update()
                     else:
                         loss.backward()
-                        self.clip_grad(self.model.parameters(), float(getattr(self.tr_cfg, "max_grad_norm", 0.0)))
-                        self.optimizer.step()
                     
-                    # Update learning rate
-                    if scheduler is not None:
-                        scheduler.step()
+                    # Only step optimizer every N accumulation steps
+                    if batch_idx % self.gradient_accumulation_steps == 0:
+                        if scaler.is_enabled():
+                            self.clip_grad(self.model.parameters(), float(getattr(self.tr_cfg, "max_grad_norm", 0.0)))
+                            scaler.step(self.optimizer)
+                            scaler.update()
+                        else:
+                            self.clip_grad(self.model.parameters(), float(getattr(self.tr_cfg, "max_grad_norm", 0.0)))
+                            self.optimizer.step()
+                        
+                        self.optimizer.zero_grad(set_to_none=True)
+                        
+                        # Update EMA after optimizer step
+                        if self.use_ema:
+                            self._update_ema()
+                        
+                        # Update learning rate
+                        if scheduler is not None:
+                            scheduler.step()
                     
-                    # Track metrics
+                    # Track metrics (use unscaled loss)
                     batch_size = batch["ego_vec"].size(0)
-                    running_loss += loss.item() * batch_size
-                    running_waypoint_loss += losses["loss_waypoint"].item() * batch_size
-                    running_speed_loss += losses["loss_speed"].item() * batch_size
+                    running_loss += unscaled_loss * batch_size
+                    running_waypoint_loss += unscaled_waypoint_loss * batch_size
+                    running_speed_loss += unscaled_speed_loss * batch_size
                     running_samples += batch_size
                     
                     global_step += 1
@@ -281,7 +334,7 @@ class BCTrainer(BaseTrainer):
                         try:
                             pbar_inner.update(1)
                             pbar_inner.set_postfix({
-                                "loss": f"{loss.item():.4f}",
+                                "loss": f"{unscaled_loss:.4f}",
                                 "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
                             })
                         except Exception:
@@ -291,9 +344,9 @@ class BCTrainer(BaseTrainer):
                         self.logger.log({
                             "step": global_step,
                             "epoch": epoch,
-                            "train/step_loss": float(loss.item()),
-                            "train/step_waypoint_loss": float(losses["loss_waypoint"].item()),
-                            "train/step_speed_loss": float(losses["loss_speed"].item()),
+                            "train/step_loss": float(unscaled_loss),
+                            "train/step_waypoint_loss": float(unscaled_waypoint_loss),
+                            "train/step_speed_loss": float(unscaled_speed_loss),
                             "lr": float(self.optimizer.param_groups[0]["lr"]),
                         })
                 
@@ -308,19 +361,26 @@ class BCTrainer(BaseTrainer):
                 train_waypoint_loss = running_waypoint_loss / max(1, running_samples)
                 train_speed_loss = running_speed_loss / max(1, running_samples)
                 
-                # Validation (simple pass for now)
-                self.model.eval()
+                # Validation (use EMA model if available)
+                eval_model = self.ema_model if self.use_ema else self.model
+                eval_model.eval()
                 val_loss = 0.0
+                val_waypoint_loss = 0.0
+                val_speed_loss = 0.0
                 val_samples = 0
                 with torch.no_grad():
                     for batch in loaders["valid"]:
                         batch = self.to_device(batch)
-                        predictions = self.model(batch)
+                        predictions = eval_model(batch)
                         losses = self.compute_loss(predictions, batch)
                         batch_size = batch["ego_vec"].size(0)
                         val_loss += losses["loss"].item() * batch_size
+                        val_waypoint_loss += losses["loss_waypoint"].item() * batch_size
+                        val_speed_loss += losses["loss_speed"].item() * batch_size
                         val_samples += batch_size
                 val_loss = val_loss / max(1, val_samples)
+                val_waypoint_loss = val_waypoint_loss / max(1, val_samples)
+                val_speed_loss = val_speed_loss / max(1, val_samples)
                 self.model.train()
                 
                 # Log epoch metrics
@@ -330,6 +390,8 @@ class BCTrainer(BaseTrainer):
                     "train/waypoint_loss": train_waypoint_loss,
                     "train/speed_loss": train_speed_loss,
                     "valid/loss": val_loss,
+                    "valid/waypoint_loss": val_waypoint_loss,
+                    "valid/speed_loss": val_speed_loss,
                     "lr": self.optimizer.param_groups[0]["lr"],
                     "time/epoch_sec": epoch_time,
                 })

@@ -4,6 +4,9 @@ tags: ["bc", "carla"]
 
 trainer:
   name: bc
+  lr_scheduler:
+    name: cosine
+    warmup: 2000  # ~2 epochs warmup for stability
   
 dataset:
   run_dir: "data/BC_v1/run-20251116-140827"
@@ -13,4 +16,3 @@ dataset:
 
 model:
   name: bc_policy
-

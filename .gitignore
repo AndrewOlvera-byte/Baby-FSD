@@ -16,3 +16,5 @@
 /pipeline/src/components/models/__pycache__
 /pipeline/src/components/optimizers/__pycache__
 *.pyc
+/pipeline/outputs
+/outputs

@@ -1,11 +1,14 @@
 name: bc
-batch_size: 32
+batch_size: 16  # Reduced from 32 to lower memory per batch
 epochs: 100
 
 optimizer:
   name: adamw
   lr: 3.0e-4
   weight_decay: 0.01
+  # Transformer-specific: lower beta2 for better stability
+  betas: [0.9, 0.95]  # Default is [0.9, 0.999]
+  eps: 1.0e-8
 
 lr_scheduler:
   name: cosine
@@ -13,9 +16,16 @@ lr_scheduler:
 
 max_grad_norm: 1.0
 
+# Gradient accumulation for larger effective batch size
+gradient_accumulation_steps: 4  # Effective batch = 16 * 4 = 64
+
+# EMA (Exponential Moving Average) for stability and better final performance
+use_ema: true
+ema_decay: 0.9999  # Standard for transformers
+
 loader:
-  num_workers: 8
-  prefetch_factor: 4
+  num_workers: 2  # Reduced from 8 to minimize worker memory pressure
+  prefetch_factor: 2  # Reduced from 4 to minimize prefetch buffer memory
   persistent_workers: true
   pin_memory: true
 

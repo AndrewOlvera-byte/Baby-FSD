@@ -6,5 +6,25 @@ from src.core.registry import register
 class AdamWFactory:
     def build(self, cfg_node, context):
         model = context["model"]
-        opt = torch.optim.AdamW(model.parameters(), lr=cfg_node.lr, weight_decay=cfg_node.weight_decay)
+        lr = float(cfg_node.lr)
+        weight_decay = float(cfg_node.weight_decay)
+        
+        # Support custom betas for transformer training
+        # Default betas=[0.9, 0.999], but transformers often benefit from lower beta2
+        betas = getattr(cfg_node, "betas", [0.9, 0.999])
+        if isinstance(betas, (list, tuple)) and len(betas) == 2:
+            betas = tuple(float(b) for b in betas)
+        else:
+            betas = (0.9, 0.999)
+        
+        # Support custom eps
+        eps = float(getattr(cfg_node, "eps", 1e-8))
+        
+        opt = torch.optim.AdamW(
+            model.parameters(), 
+            lr=lr, 
+            weight_decay=weight_decay,
+            betas=betas,
+            eps=eps
+        )
         return opt
