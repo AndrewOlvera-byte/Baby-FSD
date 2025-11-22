@@ -253,7 +253,7 @@ def main():
     LOG.info("Starting BC collection with config file %s", args.config)
 
     cfg = load_config(args.config)
-    host = cfg.get("host", "127.0.0.1")
+    host = cfg.get("host", "10.0.0.121")
     port = int(cfg.get("port", 2000))
     tm_port = int(cfg.get("tm_port", 8000))
     out_root = cfg.get("out_dir", os.path.join("data", "BC_v1"))
@@ -333,8 +333,9 @@ def main():
             N_future=N,
             M=64,  # max_objects
             C=18,
-            H=int((bev_my * 2) / bev_res),  # BEV height
-            W=int((bev_mx * 2) / bev_res),  # BEV width
+            # Match rasterize_bev output: W=meters_x/res, H=meters_y/res
+            H=int(round(bev_my / bev_res)),  # BEV height (rows)
+            W=int(round(bev_mx / bev_res)),  # BEV width (cols)
             compression=compression,
             chunk_size=chunk_size,
         )

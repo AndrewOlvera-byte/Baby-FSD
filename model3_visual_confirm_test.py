@@ -231,7 +231,7 @@ def run(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Spawn Tesla Model 3 with BehaviorAgent in CARLA and run a route with traffic and pedestrians.")
-    parser.add_argument("--host", default="127.0.0.1", help="CARLA host")
+    parser.add_argument("--host", default="10.0.0.121", help="CARLA host")
     parser.add_argument("--port", type=int, default=2000, help="CARLA port")
     parser.add_argument("--tm-port", dest="tm_port", type=int, default=8000, help="Traffic Manager port")
     parser.add_argument("--vehicles", type=int, default=50, help="Number of traffic vehicles to spawn")

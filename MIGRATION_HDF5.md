@@ -207,6 +207,7 @@ pytest tests/test_torch_dataset.py -v
 - Compression is applied at HDF5 chunk level (transparent to user)
 - Each worker process opens its own file handles (no shared state)
 - Files are opened lazily (on first `__getitem__` call) to avoid init overhead
+- Ego vectors are written already normalized; BEV/route/objects/futures are stored raw and normalized at load time
 
 ## Rollback Plan
 

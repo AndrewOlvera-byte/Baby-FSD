@@ -13,21 +13,23 @@ Verifies:
 import sys
 import os
 
-# Temporarily change to pipeline directory to make imports work like normal pipeline execution
-original_cwd = os.getcwd()
-pipeline_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'pipeline')
-os.chdir(pipeline_dir)
+# Ensure pipeline is on sys.path so `src.*` resolves
+ROOT = os.path.dirname(os.path.dirname(__file__))
+PIPELINE_DIR = os.path.join(ROOT, "pipeline")
+if PIPELINE_DIR not in sys.path:
+    sys.path.insert(0, PIPELINE_DIR)
 
-try:
-    # Bootstrap the pipeline registry first
-    from src.core.bootstrap import bootstrap
-    bootstrap()
+# Bootstrap the pipeline registry first
+from src.core.bootstrap import bootstrap
+bootstrap()
 
-    import torch
-    from components.models.bc_policy import BCPolicy
-finally:
-    # Always restore original directory
-    os.chdir(original_cwd)
+import torch
+from src.components.models.bc_policy import BCPolicy
+from tests.utils.model_checks import (
+    assert_no_nan_inf,
+    assert_grad_norms_reasonable,
+    step_loss_decreases,
+)
 
 
 def test_bc_policy():
@@ -35,6 +37,13 @@ def test_bc_policy():
     print("=" * 80)
     print("Testing BCPolicy Model")
     print("=" * 80)
+
+    # GPU-only: require CUDA and build everything on device to avoid CPU/GPU mismatch
+    if not torch.cuda.is_available():
+        import pytest
+        pytest.skip("CUDA is required for BCPolicy test (GPU-only)")
+    device = torch.device("cuda")
+    torch.cuda.empty_cache()
     
     # Model config (matching bc_policy.yaml)
     cfg = {
@@ -51,7 +60,7 @@ def test_bc_policy():
     }
     
     print("\n1. Instantiating model...")
-    model = BCPolicy(**cfg)
+    model = BCPolicy(**cfg).to(device)
     
     # Count parameters
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -68,18 +77,18 @@ def test_bc_policy():
     
     # Create dummy batch matching dataloader output
     print("\n3. Creating dummy batch...")
-    batch_size = 4
+    batch_size = 1  # keep small to reduce GPU mem during test
     
     # Create objects with proper type_id (integer 0-3)
-    objects = torch.randn(batch_size, 64, 11)
-    objects[:, :, 0] = torch.randint(0, cfg["n_object_types"], (batch_size, 64)).float()  # Valid type_ids
+    objects = torch.randn(batch_size, 64, 11, device=device)
+    objects[:, :, 0] = torch.randint(0, cfg["n_object_types"], (batch_size, 64), device=device).float()  # Valid type_ids
     
     batch = {
-        "ego_vec": torch.randn(batch_size, 14),
-        "bev": torch.randn(batch_size, 18, 150, 200),
-        "route": torch.randn(batch_size, 32, 2),
+        "ego_vec": torch.randn(batch_size, 14, device=device),
+        "bev": torch.randn(batch_size, 18, 150, 200, device=device),
+        "route": torch.randn(batch_size, 32, 2, device=device),
         "objects": objects,
-        "object_mask": torch.ones(batch_size, 64),  # All valid objects
+        "object_mask": torch.ones(batch_size, 64, device=device),  # All valid objects
     }
     
     # Set some objects to be padded (mask = 0)
@@ -119,23 +128,8 @@ def test_bc_policy():
     print(f"   future_v range: [{v_min:.3f}, {v_max:.3f}]")
     print(f"   (Note: Outputs will be trained to match normalized data in [-1,1] or [0,1])")
     
-    # Test with CUDA if available
-    if torch.cuda.is_available():
-        print("\n6. Testing with CUDA...")
-        model_cuda = model.cuda()
-        batch_cuda = {k: v.cuda() if isinstance(v, torch.Tensor) else v 
-                      for k, v in batch.items()}
-        
-        with torch.no_grad():
-            outputs_cuda = model_cuda(batch_cuda)
-        
-        print(f"   [OK] CUDA forward pass successful")
-        print(f"   [OK] GPU outputs shapes match CPU")
-    else:
-        print("\n6. CUDA not available, skipping GPU test")
-    
     # Test gradient flow
-    print("\n7. Testing gradient flow...")
+    print("\n6. Testing gradient flow...")
     model.train()
     outputs_train = model(batch)
     
@@ -149,9 +143,20 @@ def test_bc_policy():
     n_total = sum(1 for p in model.parameters() if p.requires_grad)
     
     print(f"   [OK] Gradients computed for {n_grads}/{n_total} parameter groups")
+    assert has_grads, "Expected gradients on trainable params"
+    assert_no_nan_inf(outputs_train, context="BCPolicy forward")
+    assert_grad_norms_reasonable(model.parameters(), context="BCPolicy backward")
+
+    # Tiny optimization loop: ensure loss can decrease on synthetic data
+    def simple_loss_fn(out, tgt):
+        return (out["future_xy"] - tgt["future_xy"]).pow(2).mean() + (out["future_v"] - tgt["future_v"]).pow(2).mean()
+
+    init_loss, final_loss = step_loss_decreases(model, batch, simple_loss_fn, steps=10, lr=1e-3, device=device)
+    print(f"   [OK] Loss decreased: {init_loss:.4f} -> {final_loss:.4f}")
+    assert final_loss <= init_loss * 0.8, "Expected training loss to decrease in mini loop"
     
     # Compute some architecture stats
-    print("\n8. Architecture statistics...")
+    print("\n7. Architecture statistics...")
     n_h, n_w = 150 // 8, 200 // 8
     n_bev_tokens = n_h * n_w
     n_ego_tokens = 1

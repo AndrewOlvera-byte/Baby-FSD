@@ -165,8 +165,8 @@ class BCTrajectoryDataset(Dataset):
         future_mask = torch.from_numpy(f["future_mask"][local_idx].astype(np.float32))
         
         # Normalize all features
-        # Note: HDF5 stores raw data, apply normalization
-        ego_vec = ego_vec  # Already normalized during collection
+        # Ego is pre-normalized during collection; all other fields are normalized here
+        ego_vec = ego_vec
         bev = normalize_bev(bev)
         route = normalize_route_points(route)
         objects = normalize_object_tokens(objects)

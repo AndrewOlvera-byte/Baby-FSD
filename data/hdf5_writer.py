@@ -93,7 +93,8 @@ class HDF5EpisodeSetWriter:
         self._current_file: Optional[h5py.File] = None
         self._current_set_idx = 0
         self._episodes_in_current_set = 0
-        self._buffer: List[Dict] = []  # Buffer for current episode-set
+        self._current_size = 0  # Frames written into the current set
+        self._episode_boundaries: List[int] = []  # cumulative frame offsets per episode
         
     def _get_compression_filter(self, compression: str):
         """Get HDF5 compression filter."""
@@ -112,7 +113,7 @@ class HDF5EpisodeSetWriter:
     def _open_new_set_file(self):
         """Open a new HDF5 file for the next episode set."""
         if self._current_file is not None:
-            self._current_file.close()
+            self._finalize_current_file()
         
         self._current_set_idx += 1
         filename = f"{self.run_id}_set{self._current_set_idx:03d}.h5"
@@ -120,8 +121,9 @@ class HDF5EpisodeSetWriter:
         
         self._current_file = h5py.File(filepath, "w")
         self._episodes_in_current_set = 0
-        self._buffer.clear()
-        
+        self._current_size = 0
+        self._episode_boundaries = [0]
+
         # Write metadata as file attributes
         self._current_file.attrs["run_id"] = self.run_id
         self._current_file.attrs["set_idx"] = self._current_set_idx
@@ -134,7 +136,90 @@ class HDF5EpisodeSetWriter:
         self._current_file.attrs["version"] = "2.0"
         self._current_file.attrs["norms_version"] = 1
         self._current_file.attrs["created_at"] = datetime.utcnow().isoformat()
-        
+
+        # Pre-create extendable datasets (unlimited along sample dimension)
+        chunk_n = max(1, int(self.chunk_size) if self.chunk_size is not None else 1)
+        self._current_file.create_dataset(
+            "frame_id",
+            shape=(0,),
+            maxshape=(None,),
+            dtype=np.int64,
+            chunks=(chunk_n,),
+            compression=self.compression,
+        )
+        self._current_file.create_dataset(
+            "episode_id",
+            shape=(0,),
+            maxshape=(None,),
+            dtype=np.int16,
+            chunks=(chunk_n,),
+            compression=self.compression,
+        )
+        self._current_file.create_dataset(
+            "ego_vec",
+            shape=(0, 14),
+            maxshape=(None, 14),
+            dtype=np.float32,
+            chunks=(chunk_n, 14),
+            compression=self.compression,
+        )
+        self._current_file.create_dataset(
+            "bev",
+            shape=(0, self.C, self.H, self.W),
+            maxshape=(None, self.C, self.H, self.W),
+            dtype=np.float32,
+            chunks=(chunk_n, self.C, self.H, self.W),
+            compression=self.compression,
+        )
+        self._current_file.create_dataset(
+            "route",
+            shape=(0, self.K, 2),
+            maxshape=(None, self.K, 2),
+            dtype=np.float32,
+            chunks=(chunk_n, self.K, 2),
+            compression=self.compression,
+        )
+        self._current_file.create_dataset(
+            "objects",
+            shape=(0, self.M, 11),
+            maxshape=(None, self.M, 11),
+            dtype=np.float32,
+            chunks=(chunk_n, self.M, 11),
+            compression=self.compression,
+        )
+        self._current_file.create_dataset(
+            "object_mask",
+            shape=(0, self.M),
+            maxshape=(None, self.M),
+            dtype=np.float32,
+            chunks=(chunk_n, self.M),
+            compression=self.compression,
+        )
+        self._current_file.create_dataset(
+            "future_xy",
+            shape=(0, self.N_future, 2),
+            maxshape=(None, self.N_future, 2),
+            dtype=np.float32,
+            chunks=(chunk_n, self.N_future, 2),
+            compression=self.compression,
+        )
+        self._current_file.create_dataset(
+            "future_v",
+            shape=(0, self.N_future),
+            maxshape=(None, self.N_future),
+            dtype=np.float32,
+            chunks=(chunk_n, self.N_future),
+            compression=self.compression,
+        )
+        self._current_file.create_dataset(
+            "future_mask",
+            shape=(0, self.N_future),
+            maxshape=(None, self.N_future),
+            dtype=np.float32,
+            chunks=(chunk_n, self.N_future),
+            compression=self.compression,
+        )
+
         return filepath
     
     def append_episode(self, frames: List[Dict]):
@@ -157,168 +242,74 @@ class HDF5EpisodeSetWriter:
             # Empty episode - don't increment counter, skip it
             print(f"Warning: Skipping empty episode (no valid frames)")
             return
-        
-        # Buffer frames with episode marker
+        # Ensure a set file is open
+        if self._current_file is None or self._episodes_in_current_set >= self.episodes_per_set:
+            self._open_new_set_file()
+
         episode_id = self._episodes_in_current_set
-        for frame in frames:
-            frame_copy = frame.copy()
-            frame_copy["episode_id"] = episode_id
-            self._buffer.append(frame_copy)
-        
+        batch_size = max(1, min(int(self.chunk_size) if self.chunk_size is not None else 128, len(frames)))
+        idx = 0
+        while idx < len(frames):
+            batch = frames[idx: idx + batch_size]
+            b = len(batch)
+            start = self._current_size
+            end = start + b
+
+            f = self._current_file
+            # Extend datasets
+            f["frame_id"].resize((end,))
+            f["episode_id"].resize((end,))
+            f["ego_vec"].resize((end, 14))
+            f["bev"].resize((end, self.C, self.H, self.W))
+            f["route"].resize((end, self.K, 2))
+            f["objects"].resize((end, self.M, 11))
+            f["object_mask"].resize((end, self.M))
+            f["future_xy"].resize((end, self.N_future, 2))
+            f["future_v"].resize((end, self.N_future))
+            f["future_mask"].resize((end, self.N_future))
+
+            # Materialize numpy batches and write
+            f["frame_id"][start:end] = np.array([fr["frame_id"] for fr in batch], dtype=np.int64)
+            f["episode_id"][start:end] = episode_id
+            f["ego_vec"][start:end] = np.stack([fr["ego_vec"] for fr in batch]).astype(np.float32)
+            f["bev"][start:end] = np.stack([fr["bev"] for fr in batch]).astype(np.float32)
+            f["route"][start:end] = np.stack([fr["route"] for fr in batch]).astype(np.float32)
+            f["objects"][start:end] = np.stack([fr["objects"] for fr in batch]).astype(np.float32)
+            f["object_mask"][start:end] = np.stack([fr["object_mask"] for fr in batch]).astype(np.float32)
+            f["future_xy"][start:end] = np.stack([fr["future_xy"] for fr in batch]).astype(np.float32)
+            f["future_v"][start:end] = np.stack([fr["future_v"] for fr in batch]).astype(np.float32)
+            f["future_mask"][start:end] = np.stack([fr["future_mask"] for fr in batch]).astype(np.float32)
+
+            self._current_size = end
+            idx += b
+
+        # Record episode boundary and count
+        self._episode_boundaries.append(self._current_size)
         self._episodes_in_current_set += 1
-        
-        # Flush if we've accumulated enough episodes
+
+        # Close the set once the configured episode count is reached
         if self._episodes_in_current_set >= self.episodes_per_set:
-            self._flush_set()
-    
-    def _flush_set(self):
-        """Flush buffered frames to HDF5 file."""
-        # Early return if buffer is empty or invalid
-        if not self._buffer or len(self._buffer) == 0:
+            self._finalize_current_file()
+
+    def _finalize_current_file(self):
+        """Write boundary metadata and close the current set file."""
+        if self._current_file is None:
             return
-        
-        N = len(self._buffer)
-        
-        # Double-check N is positive (defensive programming)
-        if N <= 0:
-            print(f"Warning: Skipping flush of empty buffer (N={N})")
-            self._buffer.clear()
-            self._episodes_in_current_set = 0
-            return
-        
-        # Close any existing file before creating a new one
-        # This ensures we don't try to write to the same file twice
-        if self._current_file is not None:
+        try:
+            self._current_file.attrs["episode_boundaries"] = np.array(self._episode_boundaries, dtype=np.int32)
+            self._current_file.attrs["n_episodes"] = self._episodes_in_current_set
+        finally:
             try:
                 self._current_file.close()
-            except:
-                pass
-            self._current_file = None
-        
-        # Now open new file for this set
-        self._open_new_set_file()
-        
-        # Stack all frames into arrays
-        frame_ids = np.array([f["frame_id"] for f in self._buffer], dtype=np.int64)
-        episode_ids = np.array([f["episode_id"] for f in self._buffer], dtype=np.int16)
-        
-        # Validate that arrays were created successfully
-        if len(frame_ids) == 0 or len(episode_ids) == 0:
-            print(f"Warning: Failed to create frame arrays from buffer, skipping flush")
-            self._buffer.clear()
-            self._episodes_in_current_set = 0
-            if self._current_file is not None:
-                self._current_file.close()
+            finally:
                 self._current_file = None
-            return
-        
-        # Pre-allocate arrays
-        ego_vecs = np.zeros((N, 14), dtype=np.float32)
-        bevs = np.zeros((N, self.C, self.H, self.W), dtype=np.float32)
-        routes = np.zeros((N, self.K, 2), dtype=np.float32)
-        objects = np.zeros((N, self.M, 11), dtype=np.float32)
-        object_masks = np.zeros((N, self.M), dtype=np.float32)
-        future_xys = np.zeros((N, self.N_future, 2), dtype=np.float32)
-        future_vs = np.zeros((N, self.N_future), dtype=np.float32)
-        future_masks = np.zeros((N, self.N_future), dtype=np.float32)
-        
-        # Fill arrays
-        for i, frame in enumerate(self._buffer):
-            ego_vecs[i] = frame["ego_vec"]
-            bevs[i] = frame["bev"]
-            routes[i] = frame["route"]
-            objects[i] = frame["objects"]
-            object_masks[i] = frame["object_mask"]
-            future_xys[i] = frame["future_xy"]
-            future_vs[i] = frame["future_v"]
-            future_masks[i] = frame["future_mask"]
-        
-        # Define chunking for optimal access patterns
-        # Chunk along sample dimension with full feature dimensions
-        # Guard against invalid (zero/negative) chunk sizes
-        if self.chunk_size is None or self.chunk_size <= 0:
-            chunk_n = N
-        else:
-            chunk_n = min(self.chunk_size, N)
-        # HDF5 requires all chunk dimensions to be strictly positive
-        chunk_n = max(1, int(chunk_n))
-        
-        # Write datasets
-        self._current_file.create_dataset(
-            "frame_id", data=frame_ids, dtype=np.int64,
-            chunks=(chunk_n,), compression=self.compression
-        )
-        self._current_file.create_dataset(
-            "episode_id", data=episode_ids, dtype=np.int16,
-            chunks=(chunk_n,), compression=self.compression
-        )
-        self._current_file.create_dataset(
-            "ego_vec", data=ego_vecs, dtype=np.float32,
-            chunks=(chunk_n, 14), compression=self.compression
-        )
-        self._current_file.create_dataset(
-            "bev", data=bevs, dtype=np.float32,
-            chunks=(chunk_n, self.C, self.H, self.W), compression=self.compression
-        )
-        self._current_file.create_dataset(
-            "route", data=routes, dtype=np.float32,
-            chunks=(chunk_n, self.K, 2), compression=self.compression
-        )
-        self._current_file.create_dataset(
-            "objects", data=objects, dtype=np.float32,
-            chunks=(chunk_n, self.M, 11), compression=self.compression
-        )
-        self._current_file.create_dataset(
-            "object_mask", data=object_masks, dtype=np.float32,
-            chunks=(chunk_n, self.M), compression=self.compression
-        )
-        self._current_file.create_dataset(
-            "future_xy", data=future_xys, dtype=np.float32,
-            chunks=(chunk_n, self.N_future, 2), compression=self.compression
-        )
-        self._current_file.create_dataset(
-            "future_v", data=future_vs, dtype=np.float32,
-            chunks=(chunk_n, self.N_future), compression=self.compression
-        )
-        self._current_file.create_dataset(
-            "future_mask", data=future_masks, dtype=np.float32,
-            chunks=(chunk_n, self.N_future), compression=self.compression
-        )
-        
-        # Store episode boundaries as attribute
-        episode_boundaries = []
-        current_ep = -1
-        for i, ep_id in enumerate(episode_ids):
-            if ep_id != current_ep:
-                episode_boundaries.append(i)
-                current_ep = ep_id
-        episode_boundaries.append(N)  # End boundary
-        self._current_file.attrs["episode_boundaries"] = np.array(episode_boundaries, dtype=np.int32)
-        self._current_file.attrs["n_episodes"] = self._episodes_in_current_set
-        
-        # Close file and reset for next set
-        self._current_file.close()
-        self._current_file = None
-        self._buffer.clear()
-        self._episodes_in_current_set = 0
+                self._episodes_in_current_set = 0
+                self._current_size = 0
+                self._episode_boundaries = []
     
     def close(self):
         """Flush any remaining data and close."""
-        # Only flush if we have buffered frames AND haven't reached the threshold
-        # If we've reached episodes_per_set, flush was already called
-        if self._buffer and len(self._buffer) > 0 and self._episodes_in_current_set < self.episodes_per_set:
-            print(f"Flushing partial set ({self._episodes_in_current_set} episodes, {len(self._buffer)} frames)")
-            self._flush_set()
-        
-        # Clean up any open file handle
+        # Finalize partial set if open
         if self._current_file is not None:
-            try:
-                self._current_file.close()
-            except:
-                pass
-            self._current_file = None
-        
-        # Final cleanup
-        self._buffer.clear()
-        self._episodes_in_current_set = 0
+            self._finalize_current_file()
 
