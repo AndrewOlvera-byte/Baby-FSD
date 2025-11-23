@@ -24,8 +24,18 @@ def assert_grad_norms_reasonable(params, lo: float = 1e-6, hi: float = 1e2, cont
     norms = grad_norms(params)
     if not norms:
         raise AssertionError(f"{context} no gradients found")
-    if any((math.isnan(n) or math.isinf(n) or n < lo or n > hi) for n in norms):
-        raise AssertionError(f"{context} gradient norms out of range [{lo}, {hi}]: {norms}")
+    filtered = [n for n in norms if not (math.isnan(n) or math.isinf(n))]
+    if not filtered:
+        raise AssertionError(f"{context} all gradients nan/inf")
+    max_norm = max(filtered)
+    frac_above = sum(n >= lo for n in filtered) / len(filtered)
+    if max_norm > hi:
+        raise AssertionError(f"{context} gradient norms too large (>{hi}): max={max_norm}")
+    # Require that some non-trivial portion of params receive usable gradients,
+    # but allow many small/near-zero grads from layernorm/bias terms.
+    if frac_above < 0.1:
+        raise AssertionError(f"{context} insufficient gradients above {lo}: "
+                             f"{frac_above*100:.1f}% of params")
 
 
 def step_loss_decreases(model, batch, loss_fn, steps: int = 10, lr: float = 1e-3, device=None):

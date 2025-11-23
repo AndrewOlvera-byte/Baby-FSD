@@ -21,15 +21,15 @@ window_m: 60.0          # 60m map window
 # Performance
 no_rendering: false     # Disabled for maximum throughput
 shard_rows: 1000
-max_frames: 30000
+max_frames: 550000
 
 # Agent behavior
 behavior: "normal"     # cautious | normal | aggressive
 wheelbase_m: 2.875
 
 # Episodes and traffic
-episodes: 5
-episode_max_frames: 2000
+episodes: 200
+episode_max_frames: 2750
 npc_count: 40
 
 # Visual debug

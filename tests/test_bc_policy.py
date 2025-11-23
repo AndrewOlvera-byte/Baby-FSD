@@ -28,6 +28,7 @@ from src.components.models.bc_policy import BCPolicy
 from tests.utils.model_checks import (
     assert_no_nan_inf,
     assert_grad_norms_reasonable,
+    grad_norms,
     step_loss_decreases,
 )
 
@@ -44,6 +45,8 @@ def test_bc_policy():
         pytest.skip("CUDA is required for BCPolicy test (GPU-only)")
     device = torch.device("cuda")
     torch.cuda.empty_cache()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
     
     # Model config (matching bc_policy.yaml)
     cfg = {
@@ -77,16 +80,21 @@ def test_bc_policy():
     # Create dummy batch matching dataloader output
     print("\n3. Creating dummy batch...")
     batch_size = 1  # keep small to reduce test latency and GPU usage
+    objects = torch.randn(batch_size, 64, 11, device=device)
+    type_ids = torch.randint(0, cfg["n_object_types"], (batch_size, 64), device=device)
+    objects[:, :, 0] = type_ids.float()  # ensure valid type ids for embedding
+
     batch = {
         "ego_vec": torch.randn(batch_size, 14, device=device),
         "bev": torch.randn(batch_size, 18, 150, 200, device=device),
         "route": torch.randn(batch_size, 32, 2, device=device),
-        "objects": torch.randn(batch_size, 64, 11, device=device),
+        "objects": objects,
         "object_mask": torch.ones(batch_size, 64, device=device),  # All valid objects
     }
-    
+
     # Set some objects to be padded (mask = 0)
     batch["object_mask"][:, 50:] = 0  # Last 14 objects are padded
+    batch["objects"][:, 50:, :] = 0  # Zero out padded features/type_ids for determinism
     
     print(f"   Batch shapes:")
     for key, val in batch.items():
@@ -124,21 +132,28 @@ def test_bc_policy():
     print("\n6. Testing gradient flow...")
     model.train()
     outputs_train = model(batch)
-    
-    # Dummy loss
-    loss = outputs_train["future_xy"].sum() + outputs_train["future_v"].sum()
+
+    # Synthetic targets to drive gradients through all heads
+    targets = {
+        "future_xy": torch.randn(batch_size, cfg["n_future_steps"], 2, device=device),
+        "future_v": torch.randn(batch_size, cfg["n_future_steps"], device=device),
+    }
+    loss = torch.nn.functional.mse_loss(outputs_train["future_xy"], targets["future_xy"]) + \
+           torch.nn.functional.mse_loss(outputs_train["future_v"], targets["future_v"])
     loss.backward()
     
     # Check gradients exist
     has_grads = any(p.grad is not None for p in model.parameters() if p.requires_grad)
+    norms = grad_norms(model.parameters())
     print(f"   ✓ Gradients computed: {has_grads}")
+    print(f"   Gradient norms: min={min(norms):.2e}, max={max(norms):.2e}")
     assert has_grads, "Expected gradients on trainable params"
     assert_no_nan_inf(outputs_train, context="BCPolicy forward")
     assert_grad_norms_reasonable(model.parameters(), context="BCPolicy backward")
 
     # Tiny optimization loop: ensure loss can decrease on synthetic data
-    def simple_loss_fn(out, tgt):
-        return (out["future_xy"] - tgt["future_xy"]).pow(2).mean() + (out["future_v"] - tgt["future_v"]).pow(2).mean()
+    def simple_loss_fn(out, _):
+        return (out["future_xy"] - targets["future_xy"]).pow(2).mean() + (out["future_v"] - targets["future_v"]).pow(2).mean()
 
     init_loss, final_loss = step_loss_decreases(model, batch, simple_loss_fn, steps=10, lr=1e-3, device=device)
     print(f"   ✓ Loss decreased: {init_loss:.4f} -> {final_loss:.4f}")

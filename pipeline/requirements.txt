@@ -1,7 +1,12 @@
 # === Core ===
 # Use torch/vision/audio from the base image to keep CUDA compatibility
+# Align with the pytorch/pytorch:2.7.0-cuda12.8-cudnn9 base image (ships torchvision 0.22.x)
+torchvision>=0.22.0,<0.23.0
 
-torchvision>=0.14.0,<0.15.0
+# === Testing ===
+pytest>=7.0.0
+h5py>=3.9.0
+hdf5plugin>=4.0.0
 
 # === Hydra & HPO ===
 hydra-core==1.3.*
@@ -16,9 +21,10 @@ tqdm==4.*
 rich>=12.0,<14.0
 
 # === Data / Utils ===
-numpy>=1.21.6,<1.22.0
-pandas>=1.3.5,<2.0
-scipy>=1.7.0,<1.8.0
+# Use versions compatible with Python 3.11 (Docker base image)
+numpy>=1.26.0,<2.0
+pandas>=2.1.0,<2.2
+scipy>=1.11.0,<1.13.0
 pyyaml>=6.0
 matplotlib>=3.5.0,<3.6.0
 pyarrow>=12.0

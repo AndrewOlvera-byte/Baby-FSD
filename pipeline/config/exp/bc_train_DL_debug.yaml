@@ -1,0 +1,29 @@
+name: bc_train_DL_debug
+desc: "BC dataloader throughput debug (small 5-episode set)"
+tags: ["bc", "debug", "throughput"]
+
+trainer:
+  name: bc
+  # Push loader to keep GPU fed; tweak batch_size at launch if VRAM is tight.
+  batch_size: 256
+  epochs: 1
+  gradient_accumulation_steps: 1
+  use_ema: false
+  loader:
+    num_workers: 12          # increase worker pool for HDF5 reads
+    prefetch_factor: 8       # more prefetched batches per worker
+    persistent_workers: true
+    pin_memory: true
+  lr_scheduler:
+    name: cosine
+    warmup: 500              # shorter warmup for small debug run
+
+dataset:
+  run_dir: "data/BC_v2/run-20251121-053341-5EP-DEBUG"  # 5-episode debug set
+  future_horizon: 12
+  route_points: 32
+  max_objects: 64
+  val_ratio: 0.05            # tiny val split to reduce overhead
+
+model:
+  name: bc_policy
