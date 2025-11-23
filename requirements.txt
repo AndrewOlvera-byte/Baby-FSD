@@ -19,6 +19,9 @@ hdf5plugin>=4.0.0
 # Progress bars
 tqdm>=4.65.0
 
+# WebDataset for efficient data loading
+webdataset>=0.2.0
+
 # External Dependencies (install separately):
 # - CARLA Simulator (https://carla.org/)
 # - Follow CARLA installation instructions for your platform

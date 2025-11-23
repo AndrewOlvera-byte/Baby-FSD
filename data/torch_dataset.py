@@ -1,26 +1,28 @@
 """
-PyTorch Dataset and DataLoader for BC trajectories with HDF5+LZ4 backend.
+PyTorch Dataset and DataLoader for BC trajectories with WebDataset backend.
 
-Optimized for high-throughput training with lazy loading and efficient random access.
+Optimized for high-throughput training with batch-level data loading and efficient shard iteration.
 """
 
 import os
 import glob
+import json
+import io
 from typing import Dict, List, Optional, Tuple
+from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import IterableDataset
 
 try:
-    import h5py
-    HDF5_AVAILABLE = True
+    import webdataset as wds
+    WEBDATASET_AVAILABLE = True
 except ImportError:
-    HDF5_AVAILABLE = False
-    h5py = None
+    WEBDATASET_AVAILABLE = False
+    wds = None
 
 from data.norms import (
-    normalize_ego_vector,
     normalize_route_points,
     normalize_futures,
     normalize_object_tokens,
@@ -28,10 +30,136 @@ from data.norms import (
 )
 from data.transforms import BCTransform
 
+# Required fields per sample
+REQUIRED_KEYS = [
+    "frame_id",
+    "episode_id",
+    "ego_vec",
+    "bev",
+    "route",
+    "objects",
+    "object_mask",
+    "future_xy",
+    "future_v",
+    "future_mask",
+]
 
-class BCTrajectoryDataset(Dataset):
+
+def _load_metadata(run_dir: str) -> Dict:
+    """Load metadata.json from WebDataset directory."""
+    metadata_path = os.path.join(run_dir, "metadata.json")
+    if not os.path.exists(metadata_path):
+        raise FileNotFoundError(f"metadata.json not found in {run_dir}")
+    
+    with open(metadata_path, "r") as f:
+        return json.load(f)
+
+
+def _has_all_required_keys(sample_dict: Dict[str, object]) -> bool:
+    """Return True if the sample dict contains all required .npy fields."""
+    if not hasattr(sample_dict, "keys"):
+        return False
+    keys = sample_dict.keys()
+    for field in REQUIRED_KEYS:
+        if not any(k.endswith(f".{field}.npy") or k == f"{field}.npy" for k in keys):
+            return False
+    return True
+
+
+def _parse_sample(sample_dict: Dict) -> Dict[str, np.ndarray]:
     """
-    PyTorch Dataset for BC trajectories from HDF5 episode-set files.
+    Parse a WebDataset sample dict into numpy arrays.
+    
+    WebDataset groups files by base name (before first dot).
+    Files like "00000000.frame_id.npy" and "00000000.bev.npy" are grouped together.
+    The dict keys are the full filenames like "00000000.frame_id.npy".
+    
+    Args:
+        sample_dict: Dict from WebDataset with keys like "00000000.frame_id.npy", etc.
+        
+    Returns:
+        Dict with parsed numpy arrays for a single sample
+    """
+    sample_data = {}
+    
+    for key, value in sample_dict.items():
+        if not key.endswith(".npy"):
+            continue
+        
+        # Extract field name from filename
+        # Format: "{idx:08d}.{field}.npy" or just "{field}.npy"
+        parts = key.rsplit(".", 2)  # Split from right: [idx, field, "npy"] or [field, "npy"]
+        if len(parts) == 3:
+            # Format: "{idx}.{field}.npy"
+            field_name = parts[1]
+        elif len(parts) == 2:
+            # Format: "{field}.npy"
+            field_name = parts[0]
+        else:
+            continue
+        
+        # Parse numpy array from bytes
+        if isinstance(value, bytes):
+            arr = np.load(io.BytesIO(value), allow_pickle=False)
+        elif isinstance(value, io.BytesIO):
+            arr = np.load(value, allow_pickle=False)
+        else:
+            # Already a numpy array
+            arr = value
+        
+        sample_data[field_name] = arr
+    
+    # Ensure all required keys are present
+    for key in REQUIRED_KEYS:
+        if key not in sample_data:
+            raise ValueError(f"Missing required key '{key}' in sample. Available keys: {list(sample_data.keys())}")
+    
+    return sample_data
+
+
+def _normalize_sample(sample: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
+    """
+    Normalize a sample and convert to torch tensors.
+    
+    Args:
+        sample: Dict with numpy arrays
+        
+    Returns:
+        Dict with normalized torch tensors
+    """
+    # Convert to torch tensors
+    frame_id = int(sample["frame_id"])
+    ego_vec = torch.from_numpy(sample["ego_vec"].astype(np.float32))
+    bev = torch.from_numpy(sample["bev"].astype(np.float32))
+    route = torch.from_numpy(sample["route"].astype(np.float32))
+    objects = torch.from_numpy(sample["objects"].astype(np.float32))
+    object_mask = torch.from_numpy(sample["object_mask"].astype(np.float32))
+    future_xy = torch.from_numpy(sample["future_xy"].astype(np.float32))
+    future_v = torch.from_numpy(sample["future_v"].astype(np.float32))
+    future_mask = torch.from_numpy(sample["future_mask"].astype(np.float32))
+    
+    # Normalize (ego_vec is already normalized during collection)
+    bev = normalize_bev(bev)
+    route = normalize_route_points(route)
+    objects = normalize_object_tokens(objects)
+    future_xy, future_v = normalize_futures(future_xy, future_v)
+    
+    return {
+        "frame_id": frame_id,
+        "ego_vec": ego_vec,
+        "bev": bev,
+        "route": route,
+        "objects": objects,
+        "object_mask": object_mask,
+        "future_xy": future_xy,
+        "future_v": future_v,
+        "future_mask": future_mask,
+    }
+
+
+class BCWebDataset(IterableDataset):
+    """
+    WebDataset-based PyTorch Dataset for BC trajectories.
     
     Each sample returns normalized observations and labels:
         - ego_vec: (d_ego,) ego state vector
@@ -54,10 +182,12 @@ class BCTrajectoryDataset(Dataset):
         split: str = "all",     # "train", "val", "all"
         val_ratio: float = 0.2,
         use_bev_mmap: bool = False,  # Ignored, kept for API compatibility
+        shuffle_buffer_size: int = 1000,
+        batch_size: Optional[int] = None,  # If None, don't batch in WebDataset
     ):
         """
         Args:
-            run_dir: Path to BC run directory (contains .h5 episode-set files)
+            run_dir: Path to WebDataset directory (contains shard-*.tar and metadata.json)
             future_horizon: Number of future waypoints (N)
             route_points: Number of route points (K)
             max_objects: Maximum number of object tokens (M)
@@ -65,9 +195,11 @@ class BCTrajectoryDataset(Dataset):
             split: Split type ("train", "val", "all")
             val_ratio: Fraction of data to use for validation (if split is not "all")
             use_bev_mmap: Ignored (kept for backward compatibility)
+            shuffle_buffer_size: Buffer size for WebDataset shuffling
+            batch_size: Batch size for WebDataset batching (None = no batching in WebDataset)
         """
-        if not HDF5_AVAILABLE:
-            raise ImportError("h5py is required for HDF5 dataset")
+        if not WEBDATASET_AVAILABLE:
+            raise ImportError("webdataset is required. Install with: pip install webdataset")
         
         self.run_dir = os.path.abspath(run_dir)
         self.future_horizon = future_horizon
@@ -75,155 +207,180 @@ class BCTrajectoryDataset(Dataset):
         self.max_objects = max_objects
         self.augment = augment
         self.transform = BCTransform(augment=augment)
+        self.split = split
+        self.val_ratio = val_ratio
+        self.shuffle_buffer_size = shuffle_buffer_size
+        self.batch_size = batch_size
         
-        print(f"[BCTrajectoryDataset] Initializing HDF5-backed dataset from {run_dir}")
+        print(f"[BCWebDataset] Initializing WebDataset from {run_dir}")
         
-        # Find all HDF5 episode-set files
-        h5_files = sorted(glob.glob(os.path.join(self.run_dir, "*.h5")))
+        # Load metadata
+        metadata = _load_metadata(self.run_dir)
+        self.metadata = metadata
+        self.total_samples = metadata.get("total_samples", 0)
         
-        if not h5_files:
-            raise FileNotFoundError(f"No HDF5 files found in {run_dir}")
+        # Validate metadata dimensions match config
+        K = metadata.get("K", route_points)
+        N = metadata.get("N_future", future_horizon)
+        M = metadata.get("M", max_objects)
         
-        print(f"[BCTrajectoryDataset] Found {len(h5_files)} HDF5 episode-set files")
+        if K != route_points:
+            print(f"[BCWebDataset] WARNING: metadata K={K} != config route_points={route_points}, using metadata value")
+            self.route_points = K
+        if N != future_horizon:
+            print(f"[BCWebDataset] WARNING: metadata N_future={N} != config future_horizon={future_horizon}, using metadata value")
+            self.future_horizon = N
+        if M != max_objects:
+            print(f"[BCWebDataset] WARNING: metadata M={M} != config max_objects={max_objects}, using metadata value")
+            self.max_objects = M
         
-        # Build global index: map global_idx -> (file_idx, local_idx)
-        self._file_paths = h5_files
-        self._file_lengths = []
-        self._file_cumsum = [0]
+        print(f"[BCWebDataset] Total samples: {self.total_samples:,}")
+        print(f"[BCWebDataset] Dimensions: K={K}, N={N}, M={M}, C={metadata.get('C', 18)}, H={metadata.get('H', 150)}, W={metadata.get('W', 200)}")
         
-        for fpath in h5_files:
-            with h5py.File(fpath, "r") as f:
-                n_samples = len(f["frame_id"])
-                self._file_lengths.append(n_samples)
-                self._file_cumsum.append(self._file_cumsum[-1] + n_samples)
+        # Find all shard files
+        shard_pattern = os.path.join(self.run_dir, "shard-*.tar")
+        shard_files = sorted(glob.glob(shard_pattern))
         
-        self._total_samples = self._file_cumsum[-1]
+        if not shard_files:
+            raise FileNotFoundError(f"No shard files found matching {shard_pattern}")
         
-        print(f"[BCTrajectoryDataset] Total samples across all files: {self._total_samples:,}")
+        print(f"[BCWebDataset] Found {len(shard_files)} shard files")
         
-        # Apply train/val split
+        # Apply train/val split at shard level
         if split != "all":
-            split_idx = int(self._total_samples * (1 - val_ratio))
+            split_idx = int(len(shard_files) * (1 - val_ratio))
             
             if split == "train":
-                self._start_idx = 0
-                self._end_idx = split_idx
-                print(f"[BCTrajectoryDataset] Split 'train': Using samples [0, {split_idx})")
+                self.shard_files = shard_files[:split_idx]
+                print(f"[BCWebDataset] Split 'train': Using {len(self.shard_files)} shards")
             elif split == "val":
-                self._start_idx = split_idx
-                self._end_idx = self._total_samples
-                print(f"[BCTrajectoryDataset] Split 'val': Using samples [{split_idx}, {self._total_samples})")
+                self.shard_files = shard_files[split_idx:]
+                print(f"[BCWebDataset] Split 'val': Using {len(self.shard_files)} shards")
         else:
-            self._start_idx = 0
-            self._end_idx = self._total_samples
+            self.shard_files = shard_files
         
-        # File handles (opened lazily per worker)
-        self._file_handles: Optional[List[h5py.File]] = None
+        # Build WebDataset URLs (file:// protocol for local files)
+        self.urls = [f"file://{os.path.abspath(f)}" for f in self.shard_files]
         
-        print(f"[BCTrajectoryDataset] Dataset ready: {len(self)} samples")
+        print(f"[BCWebDataset] Dataset ready: {len(self.urls)} shards")
     
-    def _ensure_files_open(self):
-        """Lazily open HDF5 files (once per worker process)."""
-        if self._file_handles is None:
-            self._file_handles = []
-            for fpath in self._file_paths:
-                f = h5py.File(fpath, "r")
-                self._file_handles.append(f)
-    
-    def _global_to_local(self, global_idx: int) -> Tuple[int, int]:
-        """Convert global index to (file_idx, local_idx)."""
-        # Binary search in cumsum
-        file_idx = np.searchsorted(self._file_cumsum, global_idx, side="right") - 1
-        local_idx = global_idx - self._file_cumsum[file_idx]
-        return file_idx, local_idx
-    
-    def __len__(self) -> int:
-        return self._end_idx - self._start_idx
-    
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Get a single normalized sample (lazy loaded from HDF5)."""
-        # Adjust for split offset
-        global_idx = self._start_idx + idx
+    def __iter__(self):
+        """Create WebDataset iterator with proper batching and epoch handling.
         
-        # Open files if not already open
-        self._ensure_files_open()
+        Follows WebDataset best practices for multi-worker DataLoader:
+        1. nodesplitter ensures each worker processes unique shards (no overlap)
+        2. with_epoch() ensures proper epoch boundaries across workers
+        3. Batching on WebDataset side for efficiency
+        """
+        # Create WebDataset pipeline
+        # Set shardshuffle explicitly: positive integer for train, 0 for val
+        if self.split == "train" or self.split == "all":
+            # Use number of shards as shuffle buffer for train
+            shardshuffle = len(self.urls)
+        else:
+            # No shard shuffling for validation
+            shardshuffle = 0
         
-        # Map to file and local index
-        file_idx, local_idx = self._global_to_local(global_idx)
-        f = self._file_handles[file_idx]
+        # Prefer built-in nodesplitter to avoid missing attribute errors on older WebDataset
+        nodesplitter = getattr(wds, "split_by_worker", None)
+        if nodesplitter is None and hasattr(wds, "utils"):
+            # Older versions expose split_by_worker under webdataset.utils
+            nodesplitter = getattr(wds.utils, "split_by_worker", None)
+        if nodesplitter is None:
+            print("[BCWebDataset] WARNING: webdataset.split_by_worker unavailable; workers may duplicate shards")
         
-        # Read all data for this sample from HDF5
-        # Note: HDF5 stores raw unnormalized data, so we normalize here
-        frame_id = int(f["frame_id"][local_idx])
-        ego_vec = torch.from_numpy(f["ego_vec"][local_idx].astype(np.float32))
-        bev = torch.from_numpy(f["bev"][local_idx].astype(np.float32))
-        route = torch.from_numpy(f["route"][local_idx].astype(np.float32))
-        objects = torch.from_numpy(f["objects"][local_idx].astype(np.float32))
-        object_mask = torch.from_numpy(f["object_mask"][local_idx].astype(np.float32))
-        future_xy = torch.from_numpy(f["future_xy"][local_idx].astype(np.float32))
-        future_v = torch.from_numpy(f["future_v"][local_idx].astype(np.float32))
-        future_mask = torch.from_numpy(f["future_mask"][local_idx].astype(np.float32))
+        dataset = wds.WebDataset(
+            self.urls,
+            shardshuffle=shardshuffle,
+            nodesplitter=nodesplitter,  # ensures unique shards per worker when available
+            empty_check=False,  # allow fewer shards than workers without raising
+        )
         
-        # Normalize all features
-        # Ego is pre-normalized during collection; all other fields are normalized here
-        ego_vec = ego_vec
-        bev = normalize_bev(bev)
-        route = normalize_route_points(route)
-        objects = normalize_object_tokens(objects)
-        future_xy, future_v = normalize_futures(future_xy, future_v)
+        # Shuffle samples within shards (if training)
+        if self.split == "train" or self.split == "all":
+            dataset = dataset.shuffle(self.shuffle_buffer_size)
         
-        sample = {
-            "frame_id": frame_id,
-            # Observations (normalized)
-            "ego_vec": ego_vec,          # (d_ego,)
-            "bev": bev,                  # (C, H, W)
-            "route": route,              # (K, 2)
-            "objects": objects,          # (M, d_obj)
-            "object_mask": object_mask,  # (M,)
-            # Labels (normalized)
-            "future_xy": future_xy,      # (N, 2)
-            "future_v": future_v,        # (N,)
-            "future_mask": future_mask,  # (N,)
-        }
+        # Decode files (WebDataset will handle basic decoding)
+        # We'll parse numpy arrays from bytes in _parse_sample
+        dataset = dataset.decode()
 
-        # Apply augmentation BEFORE returning
-        sample = self.transform(sample)
-
-        return sample
+        # Skip non-sample entries like __metadata__.json that don't carry npy fields
+        dataset = dataset.select(_has_all_required_keys)
+        
+        # Map samples to our format
+        dataset = dataset.map(_parse_sample)
+        dataset = dataset.map(_normalize_sample)
+        
+        # Apply transforms
+        if self.augment:
+            dataset = dataset.map(self.transform)
+        
+        # Batch on WebDataset side (best practice for efficiency)
+        # This allows each worker to process batches independently
+        if self.batch_size is not None:
+            dataset = dataset.batched(self.batch_size)
+        
+        # CRITICAL: with_epoch ensures proper epoch boundaries with multi-worker DataLoader.
+        # Older WebDataset versions expect an int, so use the approximate split length.
+        epoch_length = max(1, len(self))
+        dataset = dataset.with_epoch(epoch_length)
+        
+        return iter(dataset)
     
-    def __del__(self):
-        """Close file handles on cleanup."""
-        if self._file_handles is not None:
-            for f in self._file_handles:
-                try:
-                    f.close()
-                except:
-                    pass
+    def __len__(self):
+        """Approximate length (based on metadata and shard split)."""
+        if self.split == "all":
+            return self.total_samples
+        elif self.split == "train":
+            return int(self.total_samples * (1 - self.val_ratio))
+        else:  # val
+            return int(self.total_samples * self.val_ratio)
 
 
 def fast_collate_fn(batch):
     """
     Fast collate function using pre-allocated tensors.
     
-    Avoids default_collate overhead by pre-allocating output tensors
-    and directly copying data. This is faster than PyTorch's default
-    collate which does multiple intermediate allocations.
+    Receives batches from WebDataset (list of sample dicts) when using .batched().
+    When DataLoader has batch_size=None, it passes WebDataset batches directly.
     
     Args:
-        batch: List of sample dicts from BCTrajectoryDataset
+        batch: List of sample dicts from BCWebDataset (already batched by WebDataset)
         
     Returns:
         Batched dict with all tensors stacked along batch dimension
     """
+    # If WebDataset already produced a batched dict (bev is 4D), just return it.
+    if isinstance(batch, dict):
+        bev = batch.get("bev", None)
+        if torch.is_tensor(bev) and bev.ndim == 4:
+            return batch
+        batch = [batch]
+    
+    # If we received a single already-batched dict inside a list, return it.
+    if len(batch) == 1 and isinstance(batch[0], dict):
+        bev = batch[0].get("bev", None)
+        if torch.is_tensor(bev) and bev.ndim == 4:
+            return batch[0]
+    
+    # Handle empty batch
     if not batch:
         return {}
     
+    # Batch is already a list from WebDataset batching
     B = len(batch)
     
     # Get dimensions from first sample
     first = batch[0]
     d_ego = first["ego_vec"].shape[0]
-    C, H, W = first["bev"].shape
+    bev_shape = first["bev"].shape
+    if len(bev_shape) == 3:
+        C, H, W = bev_shape
+    elif len(bev_shape) == 4:
+        # Fallback: sample already has a leading batch dim; use spatial dims
+        _, C, H, W = bev_shape
+    else:
+        raise ValueError(f"Unexpected BEV shape: {bev_shape}")
     K = first["route"].shape[0]
     M = first["objects"].shape[0]
     N = first["future_xy"].shape[0]
@@ -241,7 +398,11 @@ def fast_collate_fn(batch):
     # Fast copy loop
     for i, sample in enumerate(batch):
         ego_vec[i] = sample["ego_vec"]
-        bev[i] = sample["bev"]
+        bev_tensor = sample["bev"]
+        if bev_tensor.ndim == 4 and bev_tensor.shape[0] == 1:
+            bev[i] = bev_tensor[0]
+        else:
+            bev[i] = bev_tensor
         route[i] = sample["route"]
         objects[i] = sample["objects"]
         object_mask[i] = sample["object_mask"]
@@ -259,30 +420,6 @@ def fast_collate_fn(batch):
         "future_v": future_v,
         "future_mask": future_mask,
     }
-
-
-def _worker_init_fn(worker_id):
-    """
-    Initialize worker for HDF5 file access.
-    
-    Each worker process opens its own HDF5 file handles to avoid
-    thread-safety issues with h5py.
-    
-    Args:
-        worker_id: Worker process ID (0 to num_workers-1)
-    """
-    import torch.utils.data
-    
-    # Get worker info and dataset
-    worker_info = torch.utils.data.get_worker_info()
-    if worker_info is not None:
-        dataset = worker_info.dataset
-        
-        # Force lazy file opening in this worker
-        # HDF5 files will be opened on first __getitem__ call
-        dataset._file_handles = None
-        
-        print(f"[Worker {worker_id}] Initialized for HDF5 access")
 
 
 def create_bc_dataloader(
@@ -304,12 +441,12 @@ def create_bc_dataloader(
     **kwargs
 ) -> torch.utils.data.DataLoader:
     """
-    Create an optimized PyTorch DataLoader for BC trajectories (HDF5 backend).
+    Create an optimized PyTorch DataLoader for BC trajectories (WebDataset backend).
     
     Args:
-        run_dir: Path to BC run directory
+        run_dir: Path to WebDataset directory (contains shard-*.tar and metadata.json)
         batch_size: Batch size
-        shuffle: Whether to shuffle data
+        shuffle: Whether to shuffle data (handled by WebDataset)
         num_workers: Number of worker processes for data loading (default: 4)
         prefetch_factor: Batches to prefetch per worker (default: 4)
         persistent_workers: Keep workers alive between epochs (default: True)
@@ -323,14 +460,15 @@ def create_bc_dataloader(
         split: Dataset split ("train", "val", "all")
         val_ratio: Fraction of data to use for validation
         **kwargs: Additional arguments for DataLoader
-    
+        
     Returns:
         DataLoader instance with optimized settings
     """
     import time
     start_time = time.time()
     
-    dataset = BCTrajectoryDataset(
+    # Create dataset with batching on WebDataset side (best practice)
+    dataset = BCWebDataset(
         run_dir=run_dir,
         future_horizon=future_horizon,
         route_points=route_points,
@@ -339,31 +477,47 @@ def create_bc_dataloader(
         augment=augment,
         split=split,
         val_ratio=val_ratio,
+        batch_size=batch_size,  # WebDataset handles batching
     )
     
+    # Clamp workers to shard count to avoid empty-check issues when shards < workers
+    if num_workers > 0:
+        max_workers = max(1, len(getattr(dataset, "shard_files", [])))
+        if num_workers > max_workers:
+            print(f"[BCDataLoader] Reducing num_workers from {num_workers} to {max_workers} (shards={max_workers})")
+            num_workers = max_workers
+    
     init_time = time.time() - start_time
-    print(f"[BCDataLoader] Dataset initialized in {init_time:.2f}s (HDF5 lazy loading)")
-    print(f"[BCDataLoader] Creating DataLoader: {len(dataset)} samples, batch_size={batch_size}, num_workers={num_workers}")
+    print(f"[BCDataLoader] Dataset initialized in {init_time:.2f}s (WebDataset)")
+    print(f"[BCDataLoader] Creating DataLoader: batch_size={batch_size} (handled by WebDataset), num_workers={num_workers}")
     
     # Persistent workers requires num_workers > 0
     if num_workers == 0:
         persistent_workers = False
+        prefetch_factor = None  # prefetch_factor only valid when num_workers > 0
     
+    # Optimize prefetch_factor for GPU feeding (like CIFAR implementation)
+    # Higher prefetch_factor = more batches ready, but more memory
+    # For GPU training, we want data ready when GPU needs it
+    # Default 4 is good balance: keeps GPU fed without excessive memory usage
+    # Can reduce to 2 if OOM occurs, or increase to 6-8 if memory allows and GPU is starved
+    
+    # When WebDataset batches, set DataLoader batch_size=None (best practice)
+    # The collate_fn still needed to convert list of dicts to batched tensors
+    # Since we always pass batch_size to BCWebDataset, WebDataset always batches
     dataloader_kwargs = {
-        "batch_size": batch_size,
-        "shuffle": shuffle,
+        "batch_size": None,  # WebDataset handles batching, so DataLoader doesn't batch again
+        "shuffle": False,  # WebDataset handles shuffling internally
         "num_workers": num_workers,
-        "pin_memory": pin_memory,
+        "pin_memory": pin_memory,  # Critical for GPU: enables async CPU->GPU transfer
         "drop_last": drop_last,
-        "persistent_workers": persistent_workers,
-        "collate_fn": fast_collate_fn,
+        "persistent_workers": persistent_workers,  # Keep workers alive between epochs (faster)
+        "collate_fn": fast_collate_fn,  # Still needed to stack tensors from WebDataset batches
     }
     
     # prefetch_factor only valid when num_workers > 0
     if num_workers > 0:
         dataloader_kwargs["prefetch_factor"] = prefetch_factor
-        # Add worker init function for HDF5 file handle management
-        dataloader_kwargs["worker_init_fn"] = _worker_init_fn
     
     # Merge any additional kwargs
     dataloader_kwargs.update(kwargs)

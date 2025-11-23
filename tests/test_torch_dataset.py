@@ -1,5 +1,5 @@
 """
-Tests for PyTorch BC trajectory dataset and dataloader (HDF5 backend).
+Tests for PyTorch BC trajectory dataset and dataloader (WebDataset backend).
 
 Validates shapes, dtypes, value ranges, and batch consistency.
 """
@@ -10,90 +10,127 @@ import torch
 import numpy as np
 import logging
 import tempfile
+import json
+import tarfile
+import io
+from pathlib import Path
 
-from data.torch_dataset import BCTrajectoryDataset, create_bc_dataloader
-from data.hdf5_writer import HDF5EpisodeSetWriter
+from data.torch_dataset import BCWebDataset, create_bc_dataloader
 from data.norms import (
     V_MAX, ACCEL_MAX, SPATIAL_MAX, BEV_VEL_MAX, BEV_SPEED_LIMIT_MAX
 )
 
-h5py = pytest.importorskip("h5py")
-hdf5plugin = pytest.importorskip("hdf5plugin")
+webdataset = pytest.importorskip("webdataset")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
 
-def create_test_hdf5_dataset(tmp_path, n_episodes=2, frames_per_ep=10):
-    """Helper to create a test HDF5 dataset."""
-    run_dir = tmp_path / "test_run"
+def create_test_webdataset(tmp_path, n_samples=60, samples_per_shard=20):
+    """Helper to create a test WebDataset."""
+    run_dir = tmp_path / "test_run_wds"
     run_dir.mkdir()
     
     K, N, M = 32, 12, 64
     C, H, W = 18, 150, 200
     
-    writer = HDF5EpisodeSetWriter(
-        output_dir=str(run_dir),
-        run_id="test",
-        episodes_per_set=5,
-        K=K,
-        N_future=N,
-        M=M,
-        C=C,
-        H=H,
-        W=W,
-        compression="lz4",
-    )
+    # Create metadata.json
+    metadata = {
+        "K": K,
+        "N_future": N,
+        "M": M,
+        "C": C,
+        "H": H,
+        "W": W,
+        "version": "2.0",
+        "norms_version": 1,
+        "run_id": "test",
+        "samples_per_shard": samples_per_shard,
+        "total_samples": n_samples,
+    }
     
-    all_frames = []
-    for ep in range(n_episodes):
-        episode = []
-        for i in range(frames_per_ep):
-            frame_id = ep * frames_per_ep + i
-            frame = {
-                "frame_id": frame_id,
-                "ego_vec": np.random.randn(14).astype(np.float32) * 0.5,  # Small values
-                "bev": np.random.rand(C, H, W).astype(np.float32),  # [0, 1]
-                "route": np.random.randn(K, 2).astype(np.float32) * 10.0,  # meters
-                "objects": np.random.randn(M, 11).astype(np.float32) * 5.0,
-                "object_mask": (np.random.rand(M) > 0.5).astype(np.float32),
-                "future_xy": np.random.randn(N, 2).astype(np.float32) * 10.0,
-                "future_v": np.random.rand(N).astype(np.float32) * 20.0,
-                "future_mask": np.ones((N,), dtype=np.float32),
-            }
-            episode.append(frame)
-            all_frames.append(frame)
-        writer.append_episode(episode)
+    with open(run_dir / "metadata.json", "w") as f:
+        json.dump(metadata, f, indent=2)
     
-    writer.close()
-    return str(run_dir), len(all_frames)
+    # Create shard files
+    n_shards = (n_samples + samples_per_shard - 1) // samples_per_shard
+    
+    for shard_idx in range(n_shards):
+        shard_path = run_dir / f"shard-{shard_idx:06d}.tar"
+        
+        with tarfile.open(shard_path, "w") as tar:
+            start_idx = shard_idx * samples_per_shard
+            end_idx = min(start_idx + samples_per_shard, n_samples)
+            
+            for sample_idx in range(start_idx, end_idx):
+                base_name = f"{sample_idx:08d}"
+                
+                # Create sample data
+                frame_id = np.array(sample_idx, dtype=np.int64)
+                episode_id = np.array(sample_idx // 20, dtype=np.int16)
+                ego_vec = np.random.randn(14).astype(np.float32) * 0.5
+                bev = np.random.rand(C, H, W).astype(np.float32)
+                route = np.random.randn(K, 2).astype(np.float32) * 10.0
+                objects = np.random.randn(M, 11).astype(np.float32) * 5.0
+                object_mask = (np.random.rand(M) > 0.5).astype(np.float32)
+                future_xy = np.random.randn(N, 2).astype(np.float32) * 10.0
+                future_v = np.random.rand(N).astype(np.float32) * 20.0
+                future_mask = np.ones((N,), dtype=np.float32)
+                
+                # Write each array as a separate file
+                sample_data = {
+                    "frame_id": frame_id,
+                    "episode_id": episode_id,
+                    "ego_vec": ego_vec,
+                    "bev": bev,
+                    "route": route,
+                    "objects": objects,
+                    "object_mask": object_mask,
+                    "future_xy": future_xy,
+                    "future_v": future_v,
+                    "future_mask": future_mask,
+                }
+                
+                for key, value in sample_data.items():
+                    buffer = io.BytesIO()
+                    np.save(buffer, value, allow_pickle=False)
+                    buffer.seek(0)
+                    
+                    info = tarfile.TarInfo(name=f"{base_name}.{key}.npy")
+                    info.size = len(buffer.getvalue())
+                    tar.addfile(info, buffer)
+    
+    return str(run_dir), n_samples
 
 
 @pytest.fixture(scope="module")
 def test_dataset(tmp_path_factory):
     """Create a test dataset once for all tests."""
     tmp_path = tmp_path_factory.mktemp("data")
-    run_dir, n_frames = create_test_hdf5_dataset(tmp_path, n_episodes=3, frames_per_ep=20)
-    logger.info(f"Created test dataset with {n_frames} frames in {run_dir}")
+    run_dir, n_frames = create_test_webdataset(tmp_path, n_samples=60, samples_per_shard=20)
+    logger.info(f"Created test WebDataset with {n_frames} frames in {run_dir}")
     return run_dir, n_frames
 
 
-class TestBCTrajectoryDataset:
-    """Test BCTrajectoryDataset."""
+class TestBCWebDataset:
+    """Test BCWebDataset."""
     
     def test_dataset_loads(self, test_dataset):
         """Test that dataset loads without errors."""
         run_dir, n_frames = test_dataset
-        dataset = BCTrajectoryDataset(run_dir, future_horizon=12, route_points=32, max_objects=64)
-        assert len(dataset) == n_frames
-        logger.info(f"Dataset loaded: {len(dataset)} samples")
+        dataset = BCWebDataset(run_dir, future_horizon=12, route_points=32, max_objects=64)
+        # Note: __len__ is approximate for IterableDataset
+        assert dataset.total_samples == n_frames
+        logger.info(f"Dataset loaded: {dataset.total_samples} samples")
     
     def test_sample_structure(self, test_dataset):
         """Test that sample has correct structure."""
         run_dir, _ = test_dataset
-        dataset = BCTrajectoryDataset(run_dir)
-        sample = dataset[0]
+        dataset = BCWebDataset(run_dir)
+        
+        # Get first sample from iterator
+        sample = next(iter(dataset))
         
         # Check keys
         expected_keys = {
@@ -117,8 +154,8 @@ class TestBCTrajectoryDataset:
     def test_bev_shape(self, test_dataset):
         """Test BEV tensor shape."""
         run_dir, _ = test_dataset
-        dataset = BCTrajectoryDataset(run_dir)
-        sample = dataset[0]
+        dataset = BCWebDataset(run_dir)
+        sample = next(iter(dataset))
         bev = sample["bev"]
         
         assert bev.ndim == 3
@@ -130,22 +167,22 @@ class TestBCTrajectoryDataset:
     def test_bev_values(self, test_dataset):
         """Test BEV tensor value ranges."""
         run_dir, _ = test_dataset
-        dataset = BCTrajectoryDataset(run_dir)
-        sample = dataset[0]
+        dataset = BCWebDataset(run_dir)
+        sample = next(iter(dataset))
         bev = sample["bev"]
         
         # Should be finite
         assert torch.isfinite(bev).all()
         
-        # Binary channels (0-14) should be in [0, 1]
+        # Binary channels (0-14) should be in [0, 1] after normalization
         assert bev[0:15].min() >= -0.1  # Allow small tolerance
         assert bev[0:15].max() <= 1.1
     
     def test_route_shape(self, test_dataset):
         """Test route tensor shape."""
         run_dir, _ = test_dataset
-        dataset = BCTrajectoryDataset(run_dir)
-        sample = dataset[0]
+        dataset = BCWebDataset(run_dir)
+        sample = next(iter(dataset))
         route = sample["route"]
         
         assert route.shape == (32, 2)
@@ -155,21 +192,27 @@ class TestBCTrajectoryDataset:
     def test_multiple_samples(self, test_dataset):
         """Test that we can load multiple samples."""
         run_dir, _ = test_dataset
-        dataset = BCTrajectoryDataset(run_dir)
-        n_samples = min(10, len(dataset))
+        dataset = BCWebDataset(run_dir)
+        n_samples = min(10, dataset.total_samples)
         
-        for i in range(n_samples):
-            sample = dataset[i]
+        samples = []
+        for i, sample in enumerate(dataset):
+            if i >= n_samples:
+                break
             assert sample is not None
             assert "bev" in sample
+            samples.append(sample)
+        
+        assert len(samples) == n_samples
     
     def test_frame_id_consistency(self, test_dataset):
         """Test that frame IDs are consistent."""
         run_dir, _ = test_dataset
-        dataset = BCTrajectoryDataset(run_dir)
+        dataset = BCWebDataset(run_dir)
         
-        sample1 = dataset[0]
-        sample2 = dataset[1]
+        iterator = iter(dataset)
+        sample1 = next(iterator)
+        sample2 = next(iterator)
         
         assert sample1["frame_id"] != sample2["frame_id"]
         assert isinstance(sample1["frame_id"], int)
@@ -179,19 +222,20 @@ class TestBCTrajectoryDataset:
         """Test train/val splitting."""
         run_dir, n_frames = test_dataset
         
-        train_ds = BCTrajectoryDataset(run_dir, split="train", val_ratio=0.2)
-        val_ds = BCTrajectoryDataset(run_dir, split="val", val_ratio=0.2)
+        train_ds = BCWebDataset(run_dir, split="train", val_ratio=0.2)
+        val_ds = BCWebDataset(run_dir, split="val", val_ratio=0.2)
         
-        # Check split sizes
+        # Check split sizes (approximate for shard-level split)
         expected_train = int(n_frames * 0.8)
         expected_val = n_frames - expected_train
         
-        assert len(train_ds) == expected_train
-        assert len(val_ds) == expected_val
+        # Length is approximate for IterableDataset, but should be close
+        assert abs(len(train_ds) - expected_train) < 10  # Allow some tolerance
+        assert abs(len(val_ds) - expected_val) < 10
         
-        # Check no overlap
-        train_sample = train_ds[0]
-        val_sample = val_ds[0]
+        # Check no overlap (get first samples)
+        train_sample = next(iter(train_ds))
+        val_sample = next(iter(val_ds))
         assert train_sample["frame_id"] != val_sample["frame_id"]
 
 
@@ -287,7 +331,7 @@ class TestBCDataLoader:
             num_workers=0,
         )
         
-        n_batches = min(3, len(loader))
+        n_batches = min(3, len(loader) if hasattr(loader, "__len__") else 3)
         batches = []
         
         for i, batch in enumerate(loader):
@@ -308,8 +352,8 @@ class TestObjectTokens:
     def test_objects_shape(self, test_dataset):
         """Test objects tensor shape."""
         run_dir, _ = test_dataset
-        dataset = BCTrajectoryDataset(run_dir)
-        sample = dataset[0]
+        dataset = BCWebDataset(run_dir)
+        sample = next(iter(dataset))
         objects = sample["objects"]
         object_mask = sample["object_mask"]
         
@@ -321,8 +365,8 @@ class TestObjectTokens:
     def test_object_mask_validity(self, test_dataset):
         """Test object mask values."""
         run_dir, _ = test_dataset
-        dataset = BCTrajectoryDataset(run_dir)
-        sample = dataset[0]
+        dataset = BCWebDataset(run_dir)
+        sample = next(iter(dataset))
         object_mask = sample["object_mask"]
         
         # Mask should be binary (0 or 1)
@@ -338,8 +382,8 @@ class TestNormalization:
     def test_ego_vec_normalization(self, test_dataset):
         """Test ego vector is normalized."""
         run_dir, _ = test_dataset
-        dataset = BCTrajectoryDataset(run_dir)
-        sample = dataset[0]
+        dataset = BCWebDataset(run_dir)
+        sample = next(iter(dataset))
         ego_vec = sample["ego_vec"]
         
         assert ego_vec.ndim == 1
@@ -351,8 +395,8 @@ class TestNormalization:
     def test_route_normalization(self, test_dataset):
         """Test route points are normalized."""
         run_dir, _ = test_dataset
-        dataset = BCTrajectoryDataset(run_dir)
-        sample = dataset[0]
+        dataset = BCWebDataset(run_dir)
+        sample = next(iter(dataset))
         route = sample["route"]
         
         assert route.shape == (32, 2)
@@ -362,8 +406,8 @@ class TestNormalization:
     def test_futures_normalization(self, test_dataset):
         """Test future waypoints and speeds are normalized."""
         run_dir, _ = test_dataset
-        dataset = BCTrajectoryDataset(run_dir)
-        sample = dataset[0]
+        dataset = BCWebDataset(run_dir)
+        sample = next(iter(dataset))
         future_xy = sample["future_xy"]
         future_v = sample["future_v"]
         
@@ -381,8 +425,8 @@ class TestFutureMasking:
     def test_future_mask_shape(self, test_dataset):
         """Test future mask has correct shape."""
         run_dir, _ = test_dataset
-        dataset = BCTrajectoryDataset(run_dir)
-        sample = dataset[0]
+        dataset = BCWebDataset(run_dir)
+        sample = next(iter(dataset))
         future_mask = sample["future_mask"]
         
         assert future_mask.shape == (12,)
@@ -391,8 +435,8 @@ class TestFutureMasking:
     def test_future_mask_values(self, test_dataset):
         """Test future mask has valid values."""
         run_dir, _ = test_dataset
-        dataset = BCTrajectoryDataset(run_dir)
-        sample = dataset[0]
+        dataset = BCWebDataset(run_dir)
+        sample = next(iter(dataset))
         future_mask = sample["future_mask"]
         
         # Mask should be binary (0 or 1)
