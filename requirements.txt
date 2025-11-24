@@ -21,6 +21,8 @@ tqdm>=4.65.0
 
 # WebDataset for efficient data loading
 webdataset>=0.2.0
+imageio>=2.34.0  # video writing for CARLA eval
+carla==0.9.15   # CARLA Python API for online eval
 
 # External Dependencies (install separately):
 # - CARLA Simulator (https://carla.org/)

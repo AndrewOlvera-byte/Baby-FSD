@@ -39,7 +39,9 @@ class HDF5EpisodeSetWriter:
         /future_xy: [N, N_fut, 2] float32 - future waypoints
         /future_v: [N, N_fut] float32 - future speeds
         /future_mask: [N, N_fut] float32 - future validity mask
-        
+        /reward_*: [N] float32 - raw/clipped/normalized reward and components
+        /noise_injected: [N] bool - whether control noise was applied
+    
     Attributes (metadata):
         K, N_future, C, H, W, version, norms_version, etc.
     """
@@ -57,6 +59,7 @@ class HDF5EpisodeSetWriter:
         W: int = 200,
         compression: str = "lz4",
         chunk_size: int = 100,
+        include_rewards: bool = False,
     ):
         """
         Args:
@@ -69,6 +72,7 @@ class HDF5EpisodeSetWriter:
             C, H, W: BEV dimensions
             compression: Compression filter ("lz4", "lzf", "gzip", or None)
             chunk_size: Chunk size along sample dimension
+            include_rewards: Whether to store reward/noise datasets (offline RL)
         """
         if not HDF5_AVAILABLE:
             raise ImportError("h5py and hdf5plugin are required for HDF5 writer")
@@ -95,7 +99,8 @@ class HDF5EpisodeSetWriter:
         self._episodes_in_current_set = 0
         self._current_size = 0  # Frames written into the current set
         self._episode_boundaries: List[int] = []  # cumulative frame offsets per episode
-        
+        self.include_rewards = bool(include_rewards)
+    
     def _get_compression_filter(self, compression: str):
         """Get HDF5 compression filter."""
         if compression is None or compression.lower() == "none":
@@ -133,8 +138,10 @@ class HDF5EpisodeSetWriter:
         self._current_file.attrs["C"] = self.C
         self._current_file.attrs["H"] = self.H
         self._current_file.attrs["W"] = self.W
-        self._current_file.attrs["version"] = "2.0"
+        self._current_file.attrs["version"] = "2.1" if self.include_rewards else "2.0"
         self._current_file.attrs["norms_version"] = 1
+        if self.include_rewards:
+            self._current_file.attrs["reward_stats_version"] = 1
         self._current_file.attrs["created_at"] = datetime.utcnow().isoformat()
 
         # Pre-create extendable datasets (unlimited along sample dimension)
@@ -219,6 +226,36 @@ class HDF5EpisodeSetWriter:
             chunks=(chunk_n, self.N_future),
             compression=self.compression,
         )
+        if self.include_rewards:
+            for name in [
+                "reward_raw",
+                "reward_clipped",
+                "reward_normalized",
+                "reward_progress",
+                "reward_collision",
+                "reward_offroad",
+                "reward_violation",
+                "reward_comfort",
+                "reward_completion",
+                "reward_mean",
+                "reward_std",
+            ]:
+                self._current_file.create_dataset(
+                    name,
+                    shape=(0,),
+                    maxshape=(None,),
+                    dtype=np.float32,
+                    chunks=(chunk_n,),
+                    compression=self.compression,
+                )
+            self._current_file.create_dataset(
+                "noise_injected",
+                shape=(0,),
+                maxshape=(None,),
+                dtype=np.bool_,
+                chunks=(chunk_n,),
+                compression=self.compression,
+            )
 
         return filepath
     
@@ -267,6 +304,19 @@ class HDF5EpisodeSetWriter:
             f["future_xy"].resize((end, self.N_future, 2))
             f["future_v"].resize((end, self.N_future))
             f["future_mask"].resize((end, self.N_future))
+            if self.include_rewards:
+                f["reward_raw"].resize((end,))
+                f["reward_clipped"].resize((end,))
+                f["reward_normalized"].resize((end,))
+                f["reward_progress"].resize((end,))
+                f["reward_collision"].resize((end,))
+                f["reward_offroad"].resize((end,))
+                f["reward_violation"].resize((end,))
+                f["reward_comfort"].resize((end,))
+                f["reward_completion"].resize((end,))
+                f["reward_mean"].resize((end,))
+                f["reward_std"].resize((end,))
+                f["noise_injected"].resize((end,))
 
             # Materialize numpy batches and write
             f["frame_id"][start:end] = np.array([fr["frame_id"] for fr in batch], dtype=np.int64)
@@ -279,6 +329,40 @@ class HDF5EpisodeSetWriter:
             f["future_xy"][start:end] = np.stack([fr["future_xy"] for fr in batch]).astype(np.float32)
             f["future_v"][start:end] = np.stack([fr["future_v"] for fr in batch]).astype(np.float32)
             f["future_mask"][start:end] = np.stack([fr["future_mask"] for fr in batch]).astype(np.float32)
+
+            if self.include_rewards:
+                # Rewards and noise (default zeros if missing)
+                def _get(fr: Dict, key: str, default: float = 0.0) -> float:
+                    return float(fr.get(key, default))
+
+                f["reward_raw"][start:end] = np.array([_get(fr, "reward_raw") for fr in batch], dtype=np.float32)
+                f["reward_clipped"][start:end] = np.array([_get(fr, "reward_clipped") for fr in batch], dtype=np.float32)
+                f["reward_normalized"][start:end] = np.array(
+                    [_get(fr, "reward_normalized") for fr in batch], dtype=np.float32
+                )
+                f["reward_progress"][start:end] = np.array(
+                    [_get(fr, "reward_progress") for fr in batch], dtype=np.float32
+                )
+                f["reward_collision"][start:end] = np.array(
+                    [_get(fr, "reward_collision") for fr in batch], dtype=np.float32
+                )
+                f["reward_offroad"][start:end] = np.array(
+                    [_get(fr, "reward_offroad") for fr in batch], dtype=np.float32
+                )
+                f["reward_violation"][start:end] = np.array(
+                    [_get(fr, "reward_violation") for fr in batch], dtype=np.float32
+                )
+                f["reward_comfort"][start:end] = np.array(
+                    [_get(fr, "reward_comfort") for fr in batch], dtype=np.float32
+                )
+                f["reward_completion"][start:end] = np.array(
+                    [_get(fr, "reward_completion") for fr in batch], dtype=np.float32
+                )
+                f["reward_mean"][start:end] = np.array([_get(fr, "reward_mean") for fr in batch], dtype=np.float32)
+                f["reward_std"][start:end] = np.array([_get(fr, "reward_std") for fr in batch], dtype=np.float32)
+                f["noise_injected"][start:end] = np.array(
+                    [bool(fr.get("noise_injected", False)) for fr in batch], dtype=np.bool_
+                )
 
             self._current_size = end
             idx += b

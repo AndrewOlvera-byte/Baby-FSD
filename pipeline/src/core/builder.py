@@ -87,7 +87,7 @@ def build_trainer(cfg: Any) -> BaseTrainer:
     return trainer
 
 
-def build_evaluator(cfg: Any):
+def build_evaluator(cfg: Any, context: Dict[str, Any] | None = None):
     """
     Build evaluator callable from registry using cfg.evaluator.name if present.
     Returns None if no evaluator configured.
@@ -96,10 +96,12 @@ def build_evaluator(cfg: Any):
     if node is None or getattr(node, "name", None) is None:
         return None
     factory = get("evaluator", node.name)
-    context: Dict[str, Any] = {"cfg": cfg}
+    ctx: Dict[str, Any] = {"cfg": cfg}
     # optionally pass dataset/model if already built by caller
-    if hasattr(cfg, "_components_context") and isinstance(cfg._components_context, dict):
-        context.update(cfg._components_context)
+    if context:
+        ctx.update(context)
+    elif hasattr(cfg, "_components_context") and isinstance(cfg._components_context, dict):
+        ctx.update(cfg._components_context)
     if hasattr(factory, "build"):
-        return factory().build(node, context)
-    return factory(node, context)
+        return factory().build(node, ctx)
+    return factory(node, ctx)

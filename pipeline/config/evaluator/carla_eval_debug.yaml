@@ -1,13 +1,13 @@
 name: carla_eval
 
-# CARLA server connection
-host: "127.0.0.1"
+# CARLA server connection (debug-friendly)
+host: "10.0.0.121"
 port: 2000
 tm_port: 8000
 
-# Evaluation settings
-n_episodes: 5
-episode_max_steps: 3000
+# Evaluation settings (small for smoke test)
+n_episodes: 1
+episode_max_steps: 600  # shorter loop for quick verification
 
 # Video recording
 save_video: true
@@ -16,16 +16,16 @@ video_fps: 20
 # Simulation environment
 town: "Town10HD_Opt"
 weather: 0
-npc_count: 30
+npc_count: 0  # no NPCs for deterministic debug
 
-# Model checkpoint (override from CLI)
-checkpoint_path: ""
+# Model checkpoint (override from CLI if needed)
+checkpoint_path: "/home/drewo/projects/Baby-FSD/outputs/bc_train_debug/train/20251123_222336/reports/checkpoints/step_1.pt"
 
 # Camera settings for mp4
-camera_width: 1280
-camera_height: 720
+camera_width: 800
+camera_height: 600
 camera_fov: 90
-spectator_height: 12.0
+spectator_height: 8.0
 spectator_follow: true
 spectator_back: 8.0
 
@@ -38,12 +38,12 @@ controller:
   brake_kp: 0.3
   lookahead_idx: 2
   target_speed_mps: null  # use model prediction if null
-  steer_smoothing: 0.5    # 0=no smoothing, 1=keep previous steer
-  speed_smoothing: 0.7    # 0=no smoothing, 1=keep previous target speed
-  min_target_speed_mps: 0.0  # set >0 to avoid getting stuck
+  steer_smoothing: 0.5
+  speed_smoothing: 0.7
+  min_target_speed_mps: 0.0
 
-# Route/goal settings
-max_route_distance: 300.0
+# Optional: route/goal settings
+max_route_distance: 150.0
 
 # BEV / perception settings
 bev:
@@ -58,4 +58,3 @@ bev:
 
 actor_radius: 40.0
 window_m: 60.0
-

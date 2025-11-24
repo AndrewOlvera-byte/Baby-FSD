@@ -5,6 +5,7 @@ defaults:
   - speed: default
   - seed: default
   - logger: offline
+  - evaluator: carla_eval
   - _self_
 
 hydra:

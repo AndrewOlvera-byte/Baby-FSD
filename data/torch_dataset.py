@@ -341,33 +341,91 @@ def fast_collate_fn(batch):
     """
     Fast collate function using pre-allocated tensors.
     
-    Receives batches from WebDataset (list of sample dicts) when using .batched().
-    When DataLoader has batch_size=None, it passes WebDataset batches directly.
+    Handles batches from WebDataset in multiple formats:
+    1. Dict with lists (WebDataset .batched() format): {"bev": [tensor1, tensor2, ...], ...}
+    2. List of sample dicts: [{"bev": tensor1, ...}, {"bev": tensor2, ...}, ...]
+    3. Single dict with already-batched tensors (4D BEV)
     
     Args:
-        batch: List of sample dicts from BCWebDataset (already batched by WebDataset)
+        batch: Batch from WebDataset (format depends on WebDataset version and batching method)
         
     Returns:
         Batched dict with all tensors stacked along batch dimension
     """
-    # If WebDataset already produced a batched dict (bev is 4D), just return it.
+    # Handle empty batch
+    if not batch:
+        return {}
+    
+    # Check if already batched (4D tensor in dict)
     if isinstance(batch, dict):
         bev = batch.get("bev", None)
         if torch.is_tensor(bev) and bev.ndim == 4:
+            # Already properly batched, return as-is
             return batch
+        
+        # Check if WebDataset batched format: dict with lists
+        # WebDataset .batched() can return {"bev": [t1, t2, ...], "route": [r1, r2, ...], ...}
+        if isinstance(bev, list) and len(bev) > 0:
+            # WebDataset batched format: dict with lists
+            B = len(bev)
+            ego_vec_list = batch.get("ego_vec", [])
+            route_list = batch.get("route", [])
+            objects_list = batch.get("objects", [])
+            object_mask_list = batch.get("object_mask", [])
+            future_xy_list = batch.get("future_xy", [])
+            future_v_list = batch.get("future_v", [])
+            future_mask_list = batch.get("future_mask", [])
+            
+            if not all([ego_vec_list, route_list, objects_list, object_mask_list, future_xy_list, future_v_list, future_mask_list]):
+                raise ValueError("Missing required keys in batched dict")
+
+            def _to_tensor_list(items):
+                out = []
+                for t in items:
+                    if not torch.is_tensor(t):
+                        t = torch.as_tensor(t, dtype=torch.float32)
+                    out.append(t)
+                return out
+
+            bev_list = []
+            for t in bev:
+                if not torch.is_tensor(t):
+                    t = torch.as_tensor(t, dtype=torch.float32)
+                if t.ndim == 4 and t.shape[0] == 1:
+                    t = t[0]
+                bev_list.append(t)
+            bev_out = torch.stack(bev_list, dim=0)
+
+            ego_vec = torch.stack(_to_tensor_list(ego_vec_list), dim=0)
+            route = torch.stack(_to_tensor_list(route_list), dim=0)
+            objects = torch.stack(_to_tensor_list(objects_list), dim=0)
+            object_mask = torch.stack(_to_tensor_list(object_mask_list), dim=0)
+            future_xy = torch.stack(_to_tensor_list(future_xy_list), dim=0)
+            future_v = torch.stack(_to_tensor_list(future_v_list), dim=0)
+            future_mask = torch.stack(_to_tensor_list(future_mask_list), dim=0)
+            
+            return {
+                "ego_vec": ego_vec,
+                "bev": bev_out,
+                "route": route,
+                "objects": objects,
+                "object_mask": object_mask,
+                "future_xy": future_xy,
+                "future_v": future_v,
+                "future_mask": future_mask,
+            }
+        
+        # Single dict wrapped in list (fallback)
         batch = [batch]
     
+    # Handle list of sample dicts (standard format)
     # If we received a single already-batched dict inside a list, return it.
     if len(batch) == 1 and isinstance(batch[0], dict):
         bev = batch[0].get("bev", None)
         if torch.is_tensor(bev) and bev.ndim == 4:
             return batch[0]
     
-    # Handle empty batch
-    if not batch:
-        return {}
-    
-    # Batch is already a list from WebDataset batching
+    # Batch is a list of sample dicts from WebDataset batching
     B = len(batch)
     
     # Get dimensions from first sample

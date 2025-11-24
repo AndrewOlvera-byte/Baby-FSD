@@ -1,6 +1,20 @@
+import os
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")  # force CPU for eval runs
+
 import hydra
 from omegaconf import DictConfig
 from pathlib import Path
+import sys
+from pathlib import Path
+
+# Ensure repo root and pipeline/ are on sys.path for module resolution when run from project root
+THIS_FILE = Path(__file__).resolve()
+REPO_ROOT = THIS_FILE.parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+if str(REPO_ROOT / "pipeline") not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT / "pipeline"))
+
 from src.core.bootstrap import bootstrap
 from src.core.builder import build_trainer, build_evaluator
 from src.core.run_io import dump_full_config, write_summary, get_run_dir
@@ -13,8 +27,7 @@ def main(cfg: DictConfig) -> None:
     trainer = build_trainer(cfg)
     model = trainer.components.get("model", None)
     # Build evaluator from cfg if not provided by trainer
-    cfg._components_context = {"dataset": trainer.components.get("dataset", None), "model": model}
-    evaluator = build_evaluator(cfg)
+    evaluator = build_evaluator(cfg, context={"dataset": trainer.components.get("dataset", None), "model": model})
 
     run_dir = get_run_dir()
     reports_dir = run_dir / "reports"

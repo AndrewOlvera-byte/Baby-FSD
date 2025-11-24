@@ -31,5 +31,5 @@ loader:
 
 # Loss weights
 loss_waypoint_weight: 1.0
-loss_speed_weight: 0.1
+loss_speed_weight: 0.5  # emphasize speed fitting; adjust if speed head underfits
 

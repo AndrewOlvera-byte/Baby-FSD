@@ -10,6 +10,7 @@ import time
 from typing import Dict, Any
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from src.core.trainer_base import BaseTrainer
 from src.core.registry import register, get
@@ -216,14 +217,13 @@ class BCTrainer(BaseTrainer):
         gt_v = batch["future_v"]            # (B, N)
         future_mask = batch["future_mask"]  # (B, N)
         
-        # Compute MSE losses
-        # Waypoint loss (x, y)
+        # Losses
         waypoint_loss = (pred_xy - gt_xy).pow(2).sum(dim=-1)  # (B, N)
         waypoint_loss = (waypoint_loss * future_mask).sum() / (future_mask.sum() + 1e-8)
         
-        # Speed loss
-        speed_loss = (pred_v - gt_v).pow(2)  # (B, N)
-        speed_loss = (speed_loss * future_mask).sum() / (future_mask.sum() + 1e-8)
+        # Huber loss for speeds to reduce outlier impact
+        speed_loss_raw = F.smooth_l1_loss(pred_v, gt_v, reduction="none")  # (B, N)
+        speed_loss = (speed_loss_raw * future_mask).sum() / (future_mask.sum() + 1e-8)
         
         # Combined loss
         total_loss = (
