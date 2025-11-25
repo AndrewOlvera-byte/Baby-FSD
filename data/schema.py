@@ -1,13 +1,13 @@
 import pyarrow as pa
 
 
-# Constants (default values; override via config at runtime if needed)
-K_ROUTE_POINTS = 16
-N_FUTURE_STEPS = 6
-FIXED_DELTA_SECONDS = 0.05
-FUTURE_DELTA_SECONDS = 0.5
-ACTOR_RADIUS_METERS = 60.0
-WINDOW_METERS = 80.0
+# Constants
+K_ROUTE_POINTS = 32
+N_FUTURE_STEPS = 12
+FIXED_DELTA_SECONDS = 0.1
+FUTURE_DELTA_SECONDS = 0.2
+ACTOR_RADIUS_METERS = 40.0
+WINDOW_METERS = 60.0
 
 
 # Encodings / enums
@@ -46,7 +46,7 @@ def frames_schema() -> pa.schema:
         ("goal_dist_m", pa.float32()),
         ("at_junction", pa.int8()),
         ("dist_to_next_junction", pa.float32()),
-        # Extended ego/meta fields for full obs schema
+        # Extended ego/meta fields
         ("accel_long", pa.float32()),
         ("accel_lat", pa.float32()),
         ("steer_angle_rad", pa.float32()),
@@ -74,7 +74,6 @@ def route_points_schema() -> pa.schema:
         ("idx", pa.int16()),
         ("x_ego", pa.float32()),
         ("y_ego", pa.float32()),
-        # Optional route polyline enrichments
         ("dx", pa.float32()),
         ("dy", pa.float32()),
         ("curvature", pa.float32()),
@@ -144,8 +143,8 @@ def object_tokens_schema() -> pa.schema:
         ("shard_id", pa.int32()),
         ("frame_id", pa.int64()),
         ("idx", pa.int16()),
-        ("actor_id", pa.int64()),  # for logging/debug
-        ("type_id", pa.int8()),    # {car/truck=0, ped=1, bike=2, light=3...}
+        ("actor_id", pa.int64()),
+        ("type_id", pa.int8()),
         ("x_ego", pa.float32()),
         ("y_ego", pa.float32()),
         ("sin_yaw", pa.float32()),
@@ -167,9 +166,9 @@ def bev_frames_schema() -> pa.schema:
         ("C", pa.int16()),
         ("H", pa.int16()),
         ("W", pa.int16()),
-        ("dtype", pa.string()),          # e.g., "float32"
-        ("encoding", pa.string()),       # e.g., "npy.zstd"
-        ("channel_spec", pa.string()),   # semantic description/version of channels
+        ("dtype", pa.string()),
+        ("encoding", pa.string()),
+        ("channel_spec", pa.string()),
         ("meters_per_px", pa.float32()),
         ("x_fwd_m", pa.float32()),
         ("y_left_m", pa.float32()),
@@ -179,7 +178,7 @@ def bev_frames_schema() -> pa.schema:
         ("spec_version", pa.int16()),
         ("norms_version", pa.int16()),
         ("frame_ref", pa.string()),
-        ("data", pa.binary()),           # compressed NumPy blob
+        ("data", pa.binary()),
     ])
 
 

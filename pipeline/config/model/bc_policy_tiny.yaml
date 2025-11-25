@@ -1,0 +1,26 @@
+name: bc_policy
+
+# Tiny model for 70K samples
+# Target: ~500K parameters (1.59M was too large)
+# Rule of thumb: 100-200 samples per 1K params
+# 70K samples → 350-700K params is reasonable
+
+d_model: 96          # Reduced from 128
+n_heads: 3           # Reduced from 4 (must divide d_model)
+n_layers: 2          # Reduced from 3
+dropout: 0.3         # Increased from 0.2 for more regularization
+
+# BEV encoder
+patch_size: [12, 12] # Larger patches from [8,8] → fewer tokens
+                      # With 150×200 BEV: 13×17=221 patches (vs 19×25=475)
+
+# Input projections
+ego_hidden: 48       # Reduced from 64
+route_hidden: 48     # Reduced from 64
+object_hidden: 48    # Reduced from 64
+
+# Task-specific
+n_object_types: 4
+n_future_steps: 12
+
+# Expected size: ~500-600K params

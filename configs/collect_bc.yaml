@@ -1,4 +1,3 @@
-# Connection
 host: "10.0.0.121"
 port: 2000
 tm_port: 8000
@@ -7,47 +6,50 @@ tm_port: 8000
 out_dir: "data/BC_v2"  # v2 uses HDF5+LZ4 format
 
 # Sim timing
-fixed_dt: 0.05         # 20 Hz
-future_dt: 0.2         # label spacing
+fixed_dt: 0.1          # 10 Hz
+future_dt: 0.2
 
 # Labels / tokens
-K: 32                  # route points ahead (ego frame)
+K: 32                  # route points ahead
 N: 12                   # future waypoints/vels
 
-# Extraction windows (reduced for speed)
-actor_radius: 40.0      # 40m still covers ~3s at highway speeds
-window_m: 60.0          # 60m map window
+# Extraction windows
+actor_radius: 40.0
+window_m: 60.0
 
 # Performance
-no_rendering: false     # Disabled for maximum throughput
+no_rendering: true
 shard_rows: 1000
 max_frames: 550000
 
+# Defaults / fallbacks
+speed_limit_default_mps: 13.9   # use when map reports 0
+
 # Agent behavior
-behavior: "normal"     # cautious | normal | aggressive
+behavior: "normal"
 wheelbase_m: 2.875
 
 # Episodes and traffic
-episodes: 200
+episodes: 10
 episode_max_frames: 2750
 npc_count: 40
 
 # Visual debug
-spectator_follow: true    # Disabled for maximum throughput
-spectator_mode: "chase"    # "fpv" or "chase"
+spectator_follow: false
+spectator_mode: "chase"
 
 # BEV configuration
 bev:
-  meters_x: 80.0         # forward/back extent (x) - reduced for speed
-  meters_y: 60.0         # left/right extent (y) - reduced for speed
-  resolution_m: 0.4      # meters per pixel - reduced for speed (~4x fewer pixels)
+  meters_x: 80.0         # forward/back extent (x)
+  meters_y: 60.0         # left/right extent (y)
+  resolution_m: 0.4
   lane_width_m: 3.5
   route_corridor_width_m: 6.0
-  centerline_thickness_m: 0.6    # scaled with resolution
-  drivable_thickness_m: 6.0      # scaled with resolution
-  actor_radius_m: 1.2            # scaled with resolution
+  centerline_thickness_m: 0.6
+  drivable_thickness_m: 6.0
+  actor_radius_m: 1.2
 
-# Validation thresholds (sanity checks)
+# Validation thresholds
 validation:
   max_speed_mps: 50.0
   max_abs_accel_mps2: 12.0
@@ -58,12 +60,12 @@ validation:
 
 # Parquet storage
 parquet:
-  compression: snappy   # Much faster than gzip, similar compression ratio
+  compression: snappy
 
 # Storage backend
 storage:
-  backend: hdf5           # hdf5 (v2, optimized) | parquet_dataset (legacy) | duckdb (legacy)
-  episodes_per_set: 5     # Number of episodes per HDF5 file
-  compression: lz4        # lz4 (fast+small) | lzf (fast) | gzip (slower) | none
-  chunk_size: 100         # Chunk size along sample axis
+  backend: hdf5
+  episodes_per_set: 5
+  compression: lz4
+  chunk_size: 100
 

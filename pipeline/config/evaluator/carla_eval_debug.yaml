@@ -19,7 +19,7 @@ weather: 0
 npc_count: 0  # no NPCs for deterministic debug
 
 # Model checkpoint (override from CLI if needed)
-checkpoint_path: "/home/drewo/projects/Baby-FSD/outputs/bc_train_debug/train/20251123_222336/reports/checkpoints/step_1.pt"
+checkpoint_path: "/home/drewo/projects/Baby-FSD/outputs/bc_train_10Episode_20epoch/train/20251125_025422/reports/checkpoints/step_20.pt"
 
 # Camera settings for mp4
 camera_width: 800

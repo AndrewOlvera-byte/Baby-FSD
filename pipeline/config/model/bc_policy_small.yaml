@@ -1,0 +1,26 @@
+name: bc_policy
+
+# Smaller model for 50 episodes (~50k samples)
+# Target: ~1.5M parameters (vs 11.5M in full model)
+# Rule of thumb: params should be < samples/10 for good generalization
+
+# Model dimensions (reduced)
+d_model: 128         # was 256 -> 50% reduction
+n_heads: 4           # was 8 -> matches d_model reduction
+n_layers: 3          # was 6 -> 50% reduction (biggest impact)
+dropout: 0.2         # was 0.1 -> more regularization for small data
+
+# Future prediction
+n_future_steps: 12
+
+# ViT params for BEV (keep patch size, fewer patches = fewer tokens)
+patch_size: [8, 8]
+
+# MLP hidden dimensions (reduced)
+ego_hidden: 64       # was 128
+route_hidden: 64     # was 128
+object_hidden: 64    # was 128
+
+# Object embeddings
+n_object_types: 4    # vehicle, pedestrian, bike, other
+

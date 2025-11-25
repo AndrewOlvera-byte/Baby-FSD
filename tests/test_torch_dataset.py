@@ -9,13 +9,11 @@ import pytest
 import torch
 import numpy as np
 import logging
-import tempfile
 import json
 import tarfile
 import io
-from pathlib import Path
 
-from data.torch_dataset import BCWebDataset, create_bc_dataloader
+from data.torch_dataset import BCWebDataset, create_bc_dataloader, fast_collate_fn
 from data.norms import (
     V_MAX, ACCEL_MAX, SPATIAL_MAX, BEV_VEL_MAX, BEV_SPEED_LIMIT_MAX
 )
@@ -27,11 +25,20 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
-def create_test_webdataset(tmp_path, n_samples=60, samples_per_shard=20):
-    """Helper to create a test WebDataset."""
+def create_test_webdataset(tmp_path, n_samples=60, samples_per_shard=20, shard_sizes=None):
+    """Helper to create a test WebDataset (optionally with uneven shards)."""
     run_dir = tmp_path / "test_run_wds"
     run_dir.mkdir()
-    
+
+    if shard_sizes is None:
+        shard_sizes = []
+        remaining = n_samples
+        while remaining > 0:
+            shard_sizes.append(min(samples_per_shard, remaining))
+            remaining -= shard_sizes[-1]
+    else:
+        n_samples = sum(shard_sizes)
+
     K, N, M = 32, 12, 64
     C, H, W = 18, 150, 200
     
@@ -54,14 +61,15 @@ def create_test_webdataset(tmp_path, n_samples=60, samples_per_shard=20):
         json.dump(metadata, f, indent=2)
     
     # Create shard files
-    n_shards = (n_samples + samples_per_shard - 1) // samples_per_shard
+    n_shards = len(shard_sizes)
+    sample_offset = 0
     
-    for shard_idx in range(n_shards):
+    for shard_idx, shard_count in enumerate(shard_sizes):
         shard_path = run_dir / f"shard-{shard_idx:06d}.tar"
         
         with tarfile.open(shard_path, "w") as tar:
-            start_idx = shard_idx * samples_per_shard
-            end_idx = min(start_idx + samples_per_shard, n_samples)
+            start_idx = sample_offset
+            end_idx = start_idx + shard_count
             
             for sample_idx in range(start_idx, end_idx):
                 base_name = f"{sample_idx:08d}"
@@ -100,6 +108,21 @@ def create_test_webdataset(tmp_path, n_samples=60, samples_per_shard=20):
                     info = tarfile.TarInfo(name=f"{base_name}.{key}.npy")
                     info.size = len(buffer.getvalue())
                     tar.addfile(info, buffer)
+
+            shard_meta = {
+                "shard_idx": shard_idx,
+                "first_sample_idx": start_idx,
+                "last_sample_idx": end_idx - 1,
+                "sample_count": shard_count,
+            }
+            meta_buffer = io.BytesIO()
+            meta_buffer.write(json.dumps(shard_meta, indent=2).encode("utf-8"))
+            meta_buffer.seek(0)
+            meta_info = tarfile.TarInfo(name="__metadata__.json")
+            meta_info.size = len(meta_buffer.getvalue())
+            tar.addfile(meta_info, meta_buffer)
+
+            sample_offset = end_idx
     
     return str(run_dir), n_samples
 
@@ -237,6 +260,21 @@ class TestBCWebDataset:
         train_sample = next(iter(train_ds))
         val_sample = next(iter(val_ds))
         assert train_sample["frame_id"] != val_sample["frame_id"]
+
+    def test_len_tracks_shard_samples(self, tmp_path_factory):
+        """Length should follow shard sample counts, not ratios."""
+        tmp_path = tmp_path_factory.mktemp("uneven_shards")
+        shard_sizes = [3, 7, 2]
+        val_ratio = 0.25  # train takes first two shards
+        run_dir, total = create_test_webdataset(tmp_path, shard_sizes=shard_sizes, samples_per_shard=10)
+
+        all_ds = BCWebDataset(run_dir, split="all")
+        train_ds = BCWebDataset(run_dir, split="train", val_ratio=val_ratio)
+        val_ds = BCWebDataset(run_dir, split="val", val_ratio=val_ratio)
+
+        assert len(all_ds) == total
+        assert len(train_ds) == sum(shard_sizes[:2])
+        assert len(val_ds) == shard_sizes[2]
 
 
 class TestBCDataLoader:
@@ -441,6 +479,12 @@ class TestFutureMasking:
         
         # Mask should be binary (0 or 1)
         assert ((future_mask == 0.0) | (future_mask == 1.0)).all()
+
+
+def test_fast_collate_empty_batch_raises():
+    """fast_collate_fn should fail fast on empty batches."""
+    with pytest.raises(ValueError):
+        fast_collate_fn([])
 
 
 if __name__ == "__main__":

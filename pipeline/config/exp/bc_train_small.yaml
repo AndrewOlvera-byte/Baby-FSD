@@ -1,0 +1,90 @@
+name: bc_train_small
+desc: "Behavior Cloning training - small model for 50 episodes"
+tags: ["bc", "carla", "small"]
+
+trainer:
+  name: bc
+  batch_size: 128
+  gradient_accumulation_steps: 1
+  epochs: 50               # More epochs, early stopping will kick in
+  loss_waypoint_weight: 1.0
+  loss_speed_weight: 0.5   # Increased from 0.2 - speed prediction is important!
+  horizon_decay: 0.03      # Slightly less decay to learn full trajectory
+  drop_bev_p: 0.1          # Increased modality dropout for robustness
+  drop_objects_p: 0.1
+  max_grad_norm: 1.0
+  use_ema: true
+  ema_decay: 0.999         # Faster EMA for smaller dataset (was 0.9999)
+  
+  # Early stopping configuration
+  early_stopping:
+    enabled: true
+    patience: 7            # Stop after 7 epochs without improvement
+    min_delta: 0.0001      # Minimum improvement to count as progress
+    monitor: "valid/loss"  # Metric to monitor
+  
+  loader:
+    num_workers: 12
+    prefetch_factor: 3
+    persistent_workers: true
+    pin_memory: true
+    shuffle_buffer_size: 1000  # Single shuffle buffer
+
+  optimizer:
+    name: adamw
+    lr: 3.0e-4             # Lower LR for stability (was 6e-4)
+    weight_decay: 0.05     # Increased regularization (was 0.01)
+    betas: [0.9, 0.95]
+    eps: 1.0e-8
+
+  lr_scheduler:
+    name: cosine
+    warmup: 200            # Longer warmup for small data
+  
+dataset:
+  run_dir: "data/BC_v2/run-20251125-040239-sparse-shards-wds"  # Update with actual run dir
+  future_horizon: 12
+  route_points: 32
+  max_objects: 64
+  val_ratio: 0.2
+  
+  # Data diversity validation
+  diversity:
+    enabled: true
+    min_speed_std: 2.0           # m/s - require diverse speeds
+    min_steer_std: 0.1           # Require diverse steering
+    min_moving_ratio: 0.7        # At least 70% frames should be moving
+    max_stationary_ratio: 0.25   # At most 25% stationary frames
+    warn_on_fail: true           # Warn but don't crash
+
+model:
+  name: bc_policy
+  # Use small model config
+  d_model: 128
+  n_heads: 4
+  n_layers: 3
+  dropout: 0.2
+  patch_size: [8, 8]
+  ego_hidden: 64
+  route_hidden: 64
+  object_hidden: 64
+  n_object_types: 4
+  n_future_steps: 12
+
+# Enhanced augmentation
+augmentation:
+  enabled: true
+  p_rot: 0.5
+  max_rot_deg: 15.0        # Slightly reduced rotation
+  p_bev_cutout: 0.25       # More cutout for robustness
+  p_bev_channel_drop: 0.15
+  p_drop_bev: 0.1
+  p_drop_objects: 0.1
+  p_ego_noise: 0.2         # More ego noise
+  ego_noise_scale: 0.03    # 3% noise
+  # New augmentations
+  p_speed_scale: 0.2       # Scale speeds randomly
+  speed_scale_range: [0.8, 1.2]
+  p_trajectory_noise: 0.3  # Add noise to future waypoints
+  trajectory_noise_std: 0.02  # Normalized coordinates
+

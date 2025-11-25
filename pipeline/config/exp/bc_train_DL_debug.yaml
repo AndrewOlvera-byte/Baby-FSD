@@ -1,29 +1,96 @@
-name: bc_train_DL_debug
-desc: "BC WebDataset dataloader throughput debug (small 5-episode set)"
-tags: ["bc", "debug", "throughput", "webdataset"]
+name: bc_train_debug
+desc: "Behavior Cloning training - debug config for quick iteration"
+tags: ["bc", "carla", "debug"]
+
+# This config is optimized for:
+# - Quick training iterations
+# - Visible learning (not collapsed to mean)
+# - Good generalization on small data
 
 trainer:
   name: bc
-  # Push loader to keep GPU fed; tweak batch_size at launch if VRAM is tight.
   batch_size: 128
-  epochs: 1
   gradient_accumulation_steps: 1
-  use_ema: false
+  epochs: 100              # High max, early stopping will kick in
+  loss_waypoint_weight: 1.0
+  loss_speed_weight: 0.5   # Speed is important for driving!
+  horizon_decay: 0.02      # Mild decay
+  drop_bev_p: 0.1
+  drop_objects_p: 0.1
+  max_grad_norm: 1.0
+  use_ema: true
+  ema_decay: 0.999         # Faster EMA for small data
+  
+  # Early stopping - critical for preventing overfit
+  early_stopping:
+    enabled: true
+    patience: 10           # Stop after 10 epochs without improvement
+    min_delta: 0.0001      # Minimum improvement threshold
+    monitor: "valid/loss"
+  
   loader:
-    num_workers: 8          # WebDataset can handle more workers efficiently
-    prefetch_factor: 4       # More prefetched batches per worker
+    num_workers: 8
+    prefetch_factor: 2
     persistent_workers: true
     pin_memory: true
+    shuffle_buffer_size: 10000
+
+  optimizer:
+    name: adamw
+    lr: 2.0e-4             # Conservative LR
+    weight_decay: 0.1      # Strong regularization
+    betas: [0.9, 0.95]
+    eps: 1.0e-8
+
   lr_scheduler:
     name: cosine
-    warmup: 500              # shorter warmup for small debug run
-
+    warmup: 300            # Longer warmup
+  
 dataset:
-  run_dir: "data/BC_v2/run-20251121-053341-5EP-DEBUG-wds"  # WebDataset format (note -wds suffix)
+  # UPDATE THIS to your actual run directory after collection
+  run_dir: "data/BC_v2/run-PLACEHOLDER"
   future_horizon: 12
   route_points: 32
   max_objects: 64
-  val_ratio: 0.2             # Standard 20% validation split for better representation
+  val_ratio: 0.2
+  
+  # Data quality validation
+  diversity:
+    enabled: true
+    min_speed_std: 2.0
+    min_steer_std: 0.1
+    min_moving_ratio: 0.7
+    max_stationary_ratio: 0.25
+    warn_on_fail: true
 
+# Small model - ~1.5M params for ~50k samples
 model:
   name: bc_policy
+  d_model: 128
+  n_heads: 4
+  n_layers: 3
+  dropout: 0.25            # Higher dropout for small data
+  patch_size: [8, 8]
+  ego_hidden: 64
+  route_hidden: 64
+  object_hidden: 64
+  n_object_types: 4
+  n_future_steps: 12
+
+# Enhanced augmentation for robustness
+augmentation:
+  enabled: true
+  p_rot: 0.5
+  max_rot_deg: 15.0
+  p_bev_cutout: 0.3
+  p_bev_channel_drop: 0.2
+  p_drop_bev: 0.1
+  p_drop_objects: 0.1
+  p_ego_noise: 0.3
+  ego_noise_scale: 0.03
+  p_speed_scale: 0.3
+  speed_scale_range: [0.7, 1.3]
+  p_trajectory_noise: 0.4
+  trajectory_noise_std: 0.025
+  p_lateral_shift: 0.3
+  max_lateral_shift: 0.06

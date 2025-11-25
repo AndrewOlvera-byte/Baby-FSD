@@ -146,11 +146,11 @@ class ObjectEncoder(nn.Module):
     def __init__(self, d_obj: int, d_hidden: int, d_model: int, n_object_types: int = 4, dropout: float = 0.1):
         super().__init__()
         # Type embedding (type_id is first feature)
-        self.type_embed = nn.Embedding(n_object_types, d_model // 4)
+        self.type_embed = nn.Embedding(n_object_types, max(d_model // 2, 32))
         
         # MLP for continuous features (remaining d_obj - 1 features)
         self.mlp = nn.Sequential(
-            nn.Linear(d_obj - 1 + d_model // 4, d_hidden),
+            nn.Linear(d_obj - 1 + max(d_model // 2, 32), d_hidden),
             nn.LayerNorm(d_hidden),
             nn.ReLU(),
             nn.Dropout(dropout),
@@ -199,7 +199,7 @@ class BEVViTEncoder(nn.Module):
         self.dropout = nn.Dropout(dropout)
         
         # Position embeddings will be created dynamically based on input size
-        self.pos_embed = None
+        self.register_buffer("pos_embed", None, persistent=False)
     
     def forward(self, bev: torch.Tensor) -> torch.Tensor:
         """
@@ -386,6 +386,7 @@ class BCPolicy(nn.Module):
         ego_vec = batch["ego_vec"]
         bev = batch["bev"]
         route = batch["route"]
+        route_mask_in = batch.get("route_mask", None)
         objects = batch["objects"]
         object_mask = batch["object_mask"]
         
@@ -411,10 +412,14 @@ class BCPolicy(nn.Module):
         tokens = torch.cat([ego_tokens, route_tokens, object_tokens, bev_tokens], dim=1)
         # Shape: (B, 1 + K + M + n_patches, d_model)
         
-        # 4. Create attention mask for padded objects
+        # 4. Create attention mask for padded tokens
         # PyTorch transformer expects: True = ignore, False = attend
         ego_mask = torch.zeros(B, 1, dtype=torch.bool, device=ego_vec.device)
-        route_mask = torch.zeros(B, K, dtype=torch.bool, device=ego_vec.device)
+        if route_mask_in is not None:
+            # route_mask is (B, K) with 1 for valid; flip to ignore padded
+            route_mask = (route_mask_in == 0).to(dtype=torch.bool, device=ego_vec.device)
+        else:
+            route_mask = torch.zeros(B, K, dtype=torch.bool, device=ego_vec.device)
         object_attn_mask = (object_mask == 0)  # Flip: 0 = padded, 1 = valid -> True = ignore
         bev_mask = torch.zeros(B, n_patches, dtype=torch.bool, device=ego_vec.device)
         
@@ -436,7 +441,7 @@ class BCPolicy(nn.Module):
         )
         # Shape: (B, N, d_model)
         
-        # 8. Apply output heads
+        # 8. Apply output heads (no direct residual to keep outputs in normalized space)
         future_xy = self.waypoint_head(decoded)  # (B, N, 2)
         future_v = self.speed_head(decoded).squeeze(-1)  # (B, N)
         

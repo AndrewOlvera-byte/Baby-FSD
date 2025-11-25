@@ -52,8 +52,8 @@ def read_hdf5_sample(f: h5py.File, idx: int) -> Dict[str, np.ndarray]:
         Dict with all sample data as numpy arrays
     """
     return {
-        "frame_id": f["frame_id"][idx],
-        "episode_id": f["episode_id"][idx],
+        "frame_id": np.array(f["frame_id"][idx], dtype=np.int64),
+        "episode_id": np.array(f["episode_id"][idx], dtype=np.int16),
         "ego_vec": f["ego_vec"][idx].astype(np.float32),
         "bev": f["bev"][idx].astype(np.float32),
         "route": f["route"][idx].astype(np.float32),
@@ -232,12 +232,25 @@ def convert_hdf5_to_webdataset(
     file_lengths = []
     file_cumsum = [0]
     
+    # Validate HDF5 files have consistent schema
+    expected_keys = ["frame_id", "episode_id", "ego_vec", "bev", "route", 
+                     "objects", "object_mask", "future_xy", "future_v", "future_mask"]
+    
     for fpath in tqdm(h5_files, desc="Indexing files"):
         # Normalize path
         fpath = os.path.abspath(os.path.normpath(fpath))
         try:
             with h5py.File(fpath, "r") as f:
+                # Validate all required keys exist
+                missing_keys = [key for key in expected_keys if key not in f.keys()]
+                if missing_keys:
+                    raise IOError(f"HDF5 file {fpath} missing required keys: {missing_keys}")
+                
                 n_samples = len(f["frame_id"])
+                if n_samples == 0:
+                    print(f"[WARNING] HDF5 file {fpath} contains 0 samples, skipping")
+                    continue
+                    
                 file_lengths.append(n_samples)
                 file_cumsum.append(file_cumsum[-1] + n_samples)
         except Exception as e:
@@ -286,9 +299,8 @@ def convert_hdf5_to_webdataset(
         # Multi-worker parallel reading
         print(f"[Convert] Using {num_workers} workers for parallel reading")
         
-        # Prepare work items: split files into chunks
+        # Prepare work items: split files into chunks, with correct global offsets
         work_items = []
-        global_idx = 0
         
         # Determine chunk size (aim for 2-4 chunks per worker per file)
         for file_idx, h5_path in enumerate(h5_files):
@@ -297,11 +309,12 @@ def convert_hdf5_to_webdataset(
             
             # Chunk size: at least 100 samples, or split file into ~num_workers*2 chunks
             chunk_size = max(100, n_samples // (num_workers * 2))
+            file_start_idx = file_cumsum[file_idx]
             
             for start in range(0, n_samples, chunk_size):
                 end = min(start + chunk_size, n_samples)
-                work_items.append((h5_path, start, end, global_idx))
-                global_idx += (end - start)
+                global_start_idx = file_start_idx + start
+                work_items.append((h5_path, start, end, global_start_idx))
         
         # Stream samples as chunks arrive, write in order using priority queue (memory-efficient)
         print(f"[Convert] Reading {len(work_items)} chunks in parallel (streaming mode)...")
@@ -656,10 +669,20 @@ def verify_conversion(
                 errors.append(f"Sample {sample_idx}, key '{key}': Shape mismatch {h5_arr.shape} vs {wds_arr.shape}")
                 continue
             
-            # Check values (allow small floating point differences)
-            max_diff = np.abs(h5_arr.astype(np.float32) - wds_arr.astype(np.float32)).max()
-            if max_diff > 1e-5:
-                errors.append(f"Sample {sample_idx}, key '{key}': Max diff = {max_diff:.2e}")
+            # Check dtype for integer fields (exact match required)
+            if key in ["frame_id", "episode_id"]:
+                if h5_arr.dtype != wds_arr.dtype:
+                    errors.append(f"Sample {sample_idx}, key '{key}': Dtype mismatch {h5_arr.dtype} vs {wds_arr.dtype}")
+                    continue
+                # For integer fields, require exact match
+                if not np.array_equal(h5_arr, wds_arr):
+                    errors.append(f"Sample {sample_idx}, key '{key}': Value mismatch (integers must match exactly)")
+                    continue
+            else:
+                # Check values (allow small floating point differences for float arrays)
+                max_diff = np.abs(h5_arr.astype(np.float32) - wds_arr.astype(np.float32)).max()
+                if max_diff > 1e-5:
+                    errors.append(f"Sample {sample_idx}, key '{key}': Max diff = {max_diff:.2e}")
     
     if errors:
         print(f"\n[Verify] FAILED: Found {len(errors)} errors:")

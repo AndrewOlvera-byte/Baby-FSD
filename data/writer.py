@@ -5,7 +5,9 @@ from typing import Optional
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from deprecated import deprecated
 
+@deprecated("Use hdf5_writer instead")
 class ParquetShardWriter:
     def __init__(
         self,
@@ -82,13 +84,8 @@ def table_from_pydict(schema: pa.schema, data: dict) -> pa.Table:
     return pa.Table.from_pydict(data, schema)
 
 
+@deprecated("Use hdf5_writer instead")
 class ParquetDatasetWriter:
-    """
-    Simple dataset writer that creates a finalized Parquet file per append.
-    This avoids temp file renames and works robustly on Windows.
-    Files are written under out_dir/table_name/part-<uuid>.parquet
-    """
-
     def __init__(
         self,
         out_dir: str,
@@ -113,12 +110,8 @@ class ParquetDatasetWriter:
         # No-op; files are already finalized on each append
         return
 
-
+@deprecated("Use hdf5_writer instead")
 class DuckDBWriter:
-    """
-    Append-only writer backed by DuckDB. Each table is created once and appended via Arrow.
-    On finalize, tables can be exported to Parquet files for downstream consumption.
-    """
     def __init__(
         self,
         out_dir: str,

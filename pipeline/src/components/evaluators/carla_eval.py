@@ -366,11 +366,27 @@ class CarlaEvaluator:
                 with torch.no_grad():
                     pred = model(obs)
 
+                # Debug: Log raw model predictions
+                pred_xy_norm = pred["future_xy"][0].detach().cpu().numpy()  # (N, 2) normalized
+                pred_v_norm = pred["future_v"][0].detach().cpu().numpy()    # (N,) normalized
+                
                 # Use first future waypoint for steering target
                 # Denormalize full trajectory
                 fut_xy, fut_v = denormalize_futures(pred["future_xy"], pred["future_v"])
                 waypoints_traj = fut_xy[0].detach().cpu().numpy()  # (N, 2)
                 speeds_traj = fut_v[0].detach().cpu().numpy()      # (N,)
+                
+                # Log raw predictions (first few steps only, every 10 steps to reduce spam)
+                if steps <= 5 or steps % 10 == 0:
+                    LOG.debug(
+                        "[Step %04d] Raw predictions - future_v_norm: %s, future_xy_norm[0]: [%.4f, %.4f], "
+                        "denorm future_v[0]: %.2f m/s, denorm future_xy[0]: [%.2f, %.2f]",
+                        steps,
+                        str(pred_v_norm[:3]),  # First 3 normalized speeds
+                        pred_xy_norm[0, 0], pred_xy_norm[0, 1],  # First waypoint normalized
+                        speeds_traj[0],  # First denormalized speed
+                        waypoints_traj[0, 0], waypoints_traj[0, 1],  # First denormalized waypoint
+                    )
 
                 # Speed (current) for logging and control
                 vel = ego.get_velocity()
@@ -653,6 +669,10 @@ class CarlaEvaluator:
         bev_t = bev_t.unsqueeze(0)
         route_t = torch.from_numpy(route_np).unsqueeze(0).to(device)
         route_t = normalize_route_points(route_t)
+        # Compute route_mask (1 for valid route points, 0 for padded zeros)
+        # Matches training data format where route_mask marks valid vs padded route points
+        # route_t is already (1, 32, 2), so sum(dim=-1) gives (1, 32) - no need for extra unsqueeze
+        route_mask_t = (route_t.abs().sum(dim=-1) > 1e-3).float().to(device)
         objects_t = torch.from_numpy(objects_np).to(device)
         objects_t = normalize_object_tokens(objects_t).unsqueeze(0)
         object_mask_t = torch.from_numpy(object_mask_np).unsqueeze(0).to(device)
@@ -666,6 +686,7 @@ class CarlaEvaluator:
             "ego_vec": ego_vec,
             "bev": bev_t,
             "route": route_t,
+            "route_mask": route_mask_t,
             "objects": objects_t,
             "object_mask": object_mask_t,
             "future_xy": future_xy,

@@ -12,23 +12,23 @@ from typing import Tuple, Union
 # Normalization Constants
 # ============================================================================
 
-# Ego vector normalization (per-field)
+# Ego vector normalization
 V_MAX = 50.0            # m/s (~180 km/h)
 ACCEL_MAX = 20.0        # m/s²
-YAW_RATE_MAX = 3.0      # rad/s
-CURVATURE_MAX = 0.3     # 1/m (tight curve)
-STEER_MAX = 1.0         # normalized [-1, 1] already
-THROTTLE_MAX = 1.0      # [0, 1] already
-BRAKE_MAX = 1.0         # [0, 1] already
+YAW_RATE_MAX = 10.0     # rad/s
+CURVATURE_MAX = 1.0     # 1/m
+STEER_MAX = 1.0         # normalized [-1, 1]
+THROTTLE_MAX = 1.0      # [0, 1]
+BRAKE_MAX = 1.0         # [0, 1]
 SPEED_LIMIT_MAX = 50.0  # m/s
 
-# Spatial normalization (ego frame)
-SPATIAL_MAX = 100.0     # meters (route, futures, objects)
+# Spatial normalization
+SPATIAL_MAX = 100.0     # meters
 
-# BEV channels (0-11 are binary [0,1], already normalized)
-# Channels 15-16 (vx, vy) clipped to [-40, 40] in bev.py
+# BEV channels
+# Channels 15-16 (vx, vy) clipped to [-40, 40]
 BEV_VEL_MAX = 40.0      # m/s
-BEV_SPEED_LIMIT_MAX = 50.0  # m/s (channel 17)
+BEV_SPEED_LIMIT_MAX = 50.0  # m/s
 
 
 # ============================================================================
@@ -37,15 +37,13 @@ BEV_SPEED_LIMIT_MAX = 50.0  # m/s (channel 17)
 
 def normalize_ego_vector(frame_row) -> torch.Tensor:
     """
-    Normalize ego vehicle state from frame row.
-    
     Args:
         frame_row: pandas DataFrame row or dict-like with ego state fields
         
     Returns:
         tensor: (d_ego,) normalized ego vector
         
-    Fields (in order):
+    Fields:
         0: speed_mps / V_MAX
         1: yaw_rate / YAW_RATE_MAX
         2: accel_long / ACCEL_MAX
@@ -77,6 +75,10 @@ def normalize_ego_vector(frame_row) -> torch.Tensor:
         float(frame_row.time_of_day_sin),
         float(frame_row.time_of_day_cos),
     ], dtype=torch.float32)
+
+    # Clamp fields that can spike to keep [-1, 1]
+    ego_vec[1] = torch.clamp(ego_vec[1], -1.0, 1.0)  # yaw_rate
+    ego_vec[4] = torch.clamp(ego_vec[4], -1.0, 1.0)  # curvature
     
     return ego_vec
 
@@ -86,9 +88,7 @@ def normalize_ego_vector(frame_row) -> torch.Tensor:
 # ============================================================================
 
 def normalize_route_points(route_xy: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
-    """
-    Normalize route points in ego frame.
-    
+    """    
     Args:
         route_xy: (K, 2) array of (x, y) in ego frame (meters)
         
@@ -100,7 +100,7 @@ def normalize_route_points(route_xy: Union[np.ndarray, torch.Tensor]) -> torch.T
     
     route_xy = route_xy.float()
     
-    # Normalize to [-1, 1] based on SPATIAL_MAX
+    # Normalize to [-1, 1]
     route_norm = route_xy / SPATIAL_MAX
     
     # Clip to reasonable range
@@ -113,13 +113,8 @@ def normalize_route_points(route_xy: Union[np.ndarray, torch.Tensor]) -> torch.T
 # Future Waypoints Normalization
 # ============================================================================
 
-def normalize_futures(
-    futures_xy: Union[np.ndarray, torch.Tensor],
-    futures_v: Union[np.ndarray, torch.Tensor]
-) -> Tuple[torch.Tensor, torch.Tensor]:
+def normalize_futures(futures_xy: Union[np.ndarray, torch.Tensor], futures_v: Union[np.ndarray, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Normalize future waypoints and speeds.
-    
     Args:
         futures_xy: (N, 2) array of (x, y) in ego frame (meters)
         futures_v: (N,) array of speeds (m/s)
@@ -128,8 +123,10 @@ def normalize_futures(
         futures_xy_norm: (N, 2) normalized waypoints in [-1, 1]
         futures_v_norm: (N,) normalized speeds in [0, 1]
     """
+
     if isinstance(futures_xy, np.ndarray):
         futures_xy = torch.from_numpy(futures_xy)
+
     if isinstance(futures_v, np.ndarray):
         futures_v = torch.from_numpy(futures_v)
     
@@ -153,8 +150,6 @@ def normalize_futures(
 
 def normalize_object_tokens(tokens: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
     """
-    Normalize object tokens.
-    
     Args:
         tokens: (M, d_obj) array of object features
         
@@ -174,6 +169,7 @@ def normalize_object_tokens(tokens: Union[np.ndarray, torch.Tensor]) -> torch.Te
     Returns:
         tensor: (M, d_obj) normalized tokens
     """
+
     if isinstance(tokens, np.ndarray):
         tokens = torch.from_numpy(tokens)
     
@@ -205,8 +201,6 @@ def normalize_object_tokens(tokens: Union[np.ndarray, torch.Tensor]) -> torch.Te
 
 def normalize_bev(bev_tensor: torch.Tensor) -> torch.Tensor:
     """
-    Normalize BEV tensor channels.
-    
     Args:
         bev_tensor: (C, H, W) BEV tensor with 18 channels
         
@@ -239,13 +233,8 @@ def normalize_bev(bev_tensor: torch.Tensor) -> torch.Tensor:
 # Denormalization (for inference/visualization)
 # ============================================================================
 
-def denormalize_futures(
-    futures_xy_norm: torch.Tensor,
-    futures_v_norm: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
+def denormalize_futures(futures_xy_norm: torch.Tensor, futures_v_norm: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Denormalize future waypoints and speeds back to original scale.
-    
     Args:
         futures_xy_norm: (N, 2) normalized waypoints in [-1, 1]
         futures_v_norm: (N,) normalized speeds in [0, 1]
@@ -262,8 +251,6 @@ def denormalize_futures(
 
 def denormalize_waypoints(waypoints_norm: torch.Tensor) -> torch.Tensor:
     """
-    Denormalize waypoints back to meters.
-    
     Args:
         waypoints_norm: (..., 2) normalized waypoints in [-1, 1]
         

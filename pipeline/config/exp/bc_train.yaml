@@ -4,15 +4,44 @@ tags: ["bc", "carla"]
 
 trainer:
   name: bc
+  batch_size: 128
+  gradient_accumulation_steps: 1
+  epochs: 20
+  loss_waypoint_weight: 1.0
+  loss_speed_weight: 0.2
+  horizon_decay: 0.05        # emphasize near-term steps
+  drop_bev_p: 0.05
+  drop_objects_p: 0.05
+  max_grad_norm: 1.0
+  use_ema: true
+  ema_decay: 0.9999
+
+  loader:
+    # WebLoader pattern: workers yield samples, main process batches
+    # More workers = higher throughput (each worker reads shards independently)
+    num_workers: 8
+    prefetch_factor: 2  # Lower is fine with WebLoader (samples, not batches)
+    persistent_workers: true
+    pin_memory: true
+    shuffle_buffer_size: 5000  # Per-worker shuffle buffer
+
+  optimizer:
+    name: adamw
+    lr: 6.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.95]
+    eps: 1.0e-8
+
   lr_scheduler:
     name: cosine
-    warmup: 2000  # ~2 epochs warmup for stability
+    warmup: 100 # longer warmup for large batch
   
 dataset:
-  run_dir: "data/BC_v2/run-20251121-053341-5EP-DEBUG-wds"
+  run_dir: "data/BC_v2/run-20251125-005219-sparse-shards-wds"
   future_horizon: 12
   route_points: 32
   max_objects: 64
+  val_ratio: 0.2
 
 model:
   name: bc_policy

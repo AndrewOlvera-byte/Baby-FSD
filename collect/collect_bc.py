@@ -34,6 +34,7 @@ from carla_utils.route import (
     distance_to_goal,
     command_int_to_label,
     command_int_to_text,
+    ROAD_OPTION_TO_INT,
 )
 from carla_utils.actors import collect_nearby_actors, get_ego_state
 from carla_utils.map_vectors import extract_lane_centerline_segments, extract_traffic_light_stoplines
@@ -96,6 +97,28 @@ def check_route_sanity(
             command_int_to_label(cmd_int),
             plan_source,
         )
+
+
+def infer_command_from_futures(wp_future: List[tuple], lane_width_m: float = 3.5) -> Optional[int]:
+    """Infer a coarse command from the executed future path (ego frame)."""
+    if len(wp_future) < 2:
+        return None
+
+    far_x, far_y = wp_future[-1]
+    heading_deg = math.degrees(math.atan2(far_y, far_x))
+    lateral = far_y
+
+    # Lane change: big lateral shift with small heading change
+    if abs(lateral) > lane_width_m * 0.6 and abs(heading_deg) < 15.0:
+        return ROAD_OPTION_TO_INT["ChangeLaneLeft"] if lateral > 0 else ROAD_OPTION_TO_INT["ChangeLaneRight"]
+
+    if heading_deg > 20.0:
+        return ROAD_OPTION_TO_INT["Left"]
+    if heading_deg < -20.0:
+        return ROAD_OPTION_TO_INT["Right"]
+    if abs(heading_deg) < 10.0:
+        return ROAD_OPTION_TO_INT["LaneFollow"]
+    return ROAD_OPTION_TO_INT["Straight"]
 
 
 def set_sync(world: carla.World, tm: carla.TrafficManager, enable: bool, fixed_delta: float, no_rendering: bool) -> None:
@@ -291,6 +314,17 @@ def main():
     bev_my = float(bev_cfg.get("meters_y", 80.0))
     bev_res = float(bev_cfg.get("resolution_m", 0.25))
 
+    # Default speed limit (m/s) if the map reports 0
+    speed_limit_default_mps = float(cfg.get("speed_limit_default_mps", 13.9))  # ~50 km/h
+
+    # Futures buffer must hold the whole episode so early frames keep their horizon
+    horizon_ticks = int(math.ceil(N * future_dt / max(fixed_dt, 1e-6)))
+    future_buffer_capacity = max(
+        128,
+        episode_max_frames + horizon_ticks + 16,
+        horizon_ticks * 5,
+    )
+
     client = carla.Client(host, port)
     client.set_timeout(20.0)
     world = client.get_world()
@@ -370,7 +404,7 @@ def main():
     ego = None
     goal_tf = None
     goal_start_dist_m = 0.0
-    futures = FuturesBuffer(capacity=max(64, int(math.ceil(N * future_dt / fixed_dt)) * 3))
+    futures = FuturesBuffer(capacity=future_buffer_capacity)
 
     # Metrics / integrity counters
     frames_rows = 0
@@ -457,7 +491,7 @@ def main():
             LOG.info("=== Episode %d/%d: Starting (goal distance: %.1fm) ===", ep + 1, episodes, goal_start_dist_m)
 
             # Reset futures buffer per episode
-            futures = FuturesBuffer(capacity=max(64, int(math.ceil(N * future_dt / fixed_dt)) * 3))
+            futures = FuturesBuffer(capacity=future_buffer_capacity)
 
             ep_frames = 0
             # pending frame queue for lagged future labels
@@ -465,11 +499,37 @@ def main():
             pending = deque()
             recording_ready = False
             prime_ticks = 0
+            # Simple per-episode quality counters
+            ep_stats = {
+                "written": 0,
+                "skipped_future_missing": 0,
+                "skipped_stationary": 0,
+                "kept_stationary": 0,  # Track how many stationary frames we kept
+                "skipped_behind": 0,
+                "skipped_jump": 0,
+                "command_disagree": 0,
+                "skipped_action_mismatch": 0,
+                "speed_sum": 0.0,
+                "speed_sq_sum": 0.0,
+                "speed_count": 0,
+                "cmd_hist": {i: 0 for i in range(6)},
+                "speed_limit_fallback": 0,
+            }
+            
+            # Stopping frame configuration from config
+            stopping_cfg = cfg.get("stopping", {})
+            keep_stationary_ratio = float(stopping_cfg.get("keep_stationary_ratio", 0.15))
+            max_consecutive_stationary = int(stopping_cfg.get("max_consecutive_stationary", 5))
+            keep_near_traffic_light = bool(stopping_cfg.get("keep_near_traffic_light", True))
+            traffic_light_radius_m = float(stopping_cfg.get("traffic_light_radius_m", 15.0))
+            consecutive_stationary_count = 0
+
+            horizon_ticks = int(math.ceil(N * future_dt / max(fixed_dt, 1e-6)))
 
             while frame_id < max_frames and ep_frames < episode_max_frames:
                 world.tick()
-
-                sim_time = (frame_id + 1) * fixed_dt
+                snapshot = world.get_snapshot()
+                sim_time = float(getattr(getattr(snapshot, "timestamp", None), "elapsed_seconds", ep_frames * fixed_dt))
 
                 # Extract current state FIRST (for this frame)
                 speed_mps, yaw_rate = get_ego_state(ego)
@@ -562,6 +622,9 @@ def main():
                 speed_limit_mps = float(getattr(wp, "speed_limit", 0.0) or 0.0)
                 if speed_limit_mps > 30.0:
                     speed_limit_mps = speed_limit_mps / 3.6
+                elif speed_limit_mps <= 0.0:
+                    speed_limit_mps = speed_limit_default_mps
+                    ep_stats["speed_limit_fallback"] += 1
                 try:
                     sun_az = float(world.get_weather().sun_azimuth_angle)
                 except Exception:
@@ -608,20 +671,38 @@ def main():
                     "gear": gear,
                 }
 
-                # NO disk I/O in the control loop! Just collect in memory once recording is ready.
+                # Quick action/state sanity: skip frames where control conflicts with kinematics
+                action_ok = True
+                if speed_mps > 0.5 and brake > 0.5 and throttle > 0.2:
+                    action_ok = False  # conflicting accel/brake
+                # if speed is near zero but strong throttle with no acceleration could be fine; keep simple
+                if not action_ok:
+                    ep_stats["skipped_action_mismatch"] += 1
+                    ep_frames += 1
+                    frame_id += 1
+                    continue
+
+                # Buffer current state for future trajectory labels BEFORE queuing
                 if recording_ready:
+                    futures.add(sim_time, ego_tf, speed_mps)
                     pending.append(frame_data)
                 
-                # Buffer current state for future trajectory labels
-                futures.add(sim_time, ego_tf, speed_mps)
-                
                 frame_id += 1
+                ep_frames += 1
+
+            # After episode loop, capture extra horizon ticks to fill futures for tail frames
+            for _ in range(horizon_ticks):
+                world.tick()
+                snapshot = world.get_snapshot()
+                sim_time = float(getattr(getattr(snapshot, "timestamp", None), "elapsed_seconds", ep_frames * fixed_dt))
+                speed_mps, _ = get_ego_state(ego)
+                ego_tf = ego.get_transform()
+                futures.add(sim_time, ego_tf, speed_mps)
                 ep_frames += 1
 
             # After episode loop: flush remaining pending frames
             # Process any frames that have sufficient future data
             LOG.info("  Writing %d frames to disk...", len(pending))
-            horizon_s = N * future_dt
             frames_written = 0
             frames_skipped = 0
             
@@ -639,10 +720,90 @@ def main():
                 # (last few frames of each episode won't have complete futures)
                 if not samples or len(samples) < N or any(s is None for s in samples):
                     frames_skipped += 1
+                    ep_stats["skipped_future_missing"] += 1
                     continue
                     
                 base_tf = rec["ego_tf"]
                 wp_future, vel_future = future_waypoints_ego(base_tf, samples)
+
+                # Detect stationary frames but keep some for learning to stop
+                max_step = 0.0
+                if len(wp_future) >= 2:
+                    max_step = max(
+                        math.hypot(wp_future[i][0] - wp_future[i - 1][0], wp_future[i][1] - wp_future[i - 1][1])
+                        for i in range(1, len(wp_future))
+                    )
+                total_disp = 0.0
+                if wp_future:
+                    total_disp = math.hypot(wp_future[-1][0] - wp_future[0][0], wp_future[-1][1] - wp_future[0][1])
+                max_speed = max(vel_future) if vel_future else 0.0
+                max_forward = max((pt[0] for pt in wp_future), default=0.0)
+                
+                is_stationary = (max_step < 0.05 and total_disp < 0.2 and max_speed < 0.2)
+                
+                if is_stationary:
+                    consecutive_stationary_count += 1
+                    
+                    # Decide whether to keep this stationary frame
+                    keep_this_stationary = False
+                    
+                    # Check if near traffic light (always keep these - learning to stop at lights)
+                    if keep_near_traffic_light:
+                        try:
+                            tl = ego.get_traffic_light()
+                            if tl is not None:
+                                tl_loc = tl.get_transform().location
+                                ego_loc = rec["ego_tf"].location
+                                tl_dist = math.hypot(ego_loc.x - tl_loc.x, ego_loc.y - tl_loc.y)
+                                if tl_dist < traffic_light_radius_m:
+                                    keep_this_stationary = True
+                        except Exception:
+                            pass
+                    
+                    # Keep some stationary frames based on ratio (but not too many consecutive)
+                    if not keep_this_stationary and consecutive_stationary_count <= max_consecutive_stationary:
+                        if random.random() < keep_stationary_ratio:
+                            keep_this_stationary = True
+                    
+                    if not keep_this_stationary:
+                        frames_skipped += 1
+                        ep_stats["skipped_stationary"] += 1
+                        continue
+                    else:
+                        ep_stats["kept_stationary"] += 1
+                else:
+                    consecutive_stationary_count = 0  # Reset counter when moving
+                # Drop trajectories that sit entirely behind ego (likely bad transform/sample)
+                if max_forward < -1.0:
+                    frames_skipped += 1
+                    ep_stats["skipped_behind"] += 1
+                    continue
+
+                # Additional future sanity: drop if any step is a huge jump (likely bad sample)
+                if len(wp_future) >= 2:
+                    max_jump = max(
+                        math.hypot(wp_future[i][0] - wp_future[i - 1][0], wp_future[i][1] - wp_future[i - 1][1])
+                        for i in range(1, len(wp_future))
+                    )
+                    if max_jump > 60.0:  # ~>3 car lengths per 0.2s is unreasonable
+                        frames_skipped += 1
+                        ep_stats["skipped_jump"] += 1
+                        continue
+
+                # Align command intent check: keep map-based command but record disagreement
+                cmd_from_future = infer_command_from_futures(wp_future)
+                rec["exec_command"] = cmd_from_future
+                if cmd_from_future is not None and cmd_from_future != rec["command"]:
+                    ep_stats["command_disagree"] += 1
+
+                # Per-frame quality metrics
+                ep_stats["speed_sum"] += rec["speed_mps"]
+                ep_stats["speed_sq_sum"] += rec["speed_mps"] ** 2
+                ep_stats["speed_count"] += 1
+                cmd_key = int(rec.get("command", 0))
+                if cmd_key in ep_stats["cmd_hist"]:
+                    ep_stats["cmd_hist"][cmd_key] += 1
+                ep_stats["written"] += 1
 
                 # HDF5 backend: batch frames for episode-level write
                 if backend == "hdf5":
@@ -901,7 +1062,35 @@ def main():
                 hdf5_writer.append_episode(episode_frames)
                 frames_rows += len(episode_frames)
             
-            LOG.info("=== Episode %d/%d: Complete (%d frames written, %d skipped) ===", ep + 1, episodes, frames_written, frames_skipped)
+            # Per-episode basic distribution metrics
+            avg_speed = ep_stats["speed_sum"] / max(1, ep_stats["speed_count"])
+            cmd_hist_str = ",".join(f"{k}:{v}" for k, v in sorted(ep_stats["cmd_hist"].items()))
+
+            stationary_kept = ep_stats.get("kept_stationary", 0)
+            stationary_total = ep_stats["skipped_stationary"] + stationary_kept
+            stationary_ratio = stationary_kept / max(1, stationary_total)
+            
+            LOG.info(
+                "=== Episode %d/%d: Complete (written=%d, skipped=%d | future_missing=%d stationary_skip=%d stationary_kept=%d behind=%d jump=%d action_mismatch=%d cmd_disagree=%d) ===",
+                ep + 1,
+                episodes,
+                frames_written,
+                frames_skipped,
+                ep_stats["skipped_future_missing"],
+                ep_stats["skipped_stationary"],
+                stationary_kept,
+                ep_stats["skipped_behind"],
+                ep_stats["skipped_jump"],
+                ep_stats["skipped_action_mismatch"],
+                ep_stats["command_disagree"],
+            )
+            LOG.info(
+                "    Avg speed=%.2f m/s, stationary_ratio=%.1f%%, command histogram=%s, speed_limit_fallback_frames=%d",
+                avg_speed,
+                stationary_ratio * 100,
+                cmd_hist_str,
+                ep_stats["speed_limit_fallback"],
+            )
 
         # (Writers closed in finally)
 
