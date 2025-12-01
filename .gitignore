@@ -20,3 +20,6 @@
 /outputs
 /data/BC_v2
 *.mp4
+*.h5
+/data/BC_v3
+/data/RL_v1

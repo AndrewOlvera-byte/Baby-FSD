@@ -745,6 +745,107 @@ def create_bc_dataloader(
     return loader
 
 
+def create_rl_dataloader(
+    run_dir: str,
+    batch_size: int = 32,
+    shuffle: bool = True,
+    num_workers: int = 4,
+    prefetch_factor: int = 2,
+    persistent_workers: bool = True,
+    pin_memory: bool = True,
+    drop_last: bool = False,
+    future_horizon: int = 12,
+    route_points: int = 32,
+    max_objects: int = 64,
+    use_bev_mmap: bool = False,
+    augment: bool = False,
+    split: str = "all",
+    val_ratio: float = 0.2,
+    shuffle_buffer_size: int = 5000,
+    **kwargs
+) -> wds.WebLoader:
+    """
+    Create dataloader for offline RL training.
+
+    Args:
+        run_dir: Path to WebDataset directory (RL dataset with rewards/actions/terminals)
+        batch_size: Batch size
+        shuffle: Whether to shuffle data
+        num_workers: Number of worker processes
+        prefetch_factor: Batches to prefetch per worker
+        persistent_workers: Keep workers alive between epochs
+        pin_memory: Pin memory
+        drop_last: Drop last incomplete batch
+        future_horizon: Number of future waypoints (N)
+        route_points: Number of route points (K)
+        max_objects: Maximum number of object tokens (M)
+        use_bev_mmap: Ignored (legacy parameter)
+        augment: If True, apply data augmentation
+        split: Dataset split ("train", "val", "all")
+        val_ratio: Fraction of data for validation
+        shuffle_buffer_size: Per-worker shuffle buffer size
+        **kwargs: Additional arguments (ignored for compatibility)
+
+    Returns:
+        wds.WebLoader instance
+    """
+    start_time = time.time()
+
+    # Create dataset that yields INDIVIDUAL samples (no batching)
+    # Note: Uses BCWebDataset which should work with RL data (same base fields + optional RL fields)
+    dataset = BCWebDataset(
+        run_dir=run_dir,
+        future_horizon=future_horizon,
+        route_points=route_points,
+        max_objects=max_objects,
+        use_bev_mmap=use_bev_mmap,
+        augment=augment,
+        split=split,
+        val_ratio=val_ratio,
+        shuffle_buffer_size=shuffle_buffer_size,
+        augment_config=None,  # RL typically doesn't use CPU augmentation
+    )
+
+    init_time = time.time() - start_time
+    num_shards = len(dataset.shard_files)
+
+    print(f"[RLDataLoader] Dataset initialized in {init_time:.2f}s")
+    print(f"[RLDataLoader] Using WebLoader pattern: {num_shards} shards, {num_workers} workers")
+    print(f"[RLDataLoader] RL mode: expects reward/action/done fields in dataset")
+
+    # Adjust workers
+    if num_workers == 0:
+        persistent_workers = False
+        prefetch_factor = 2
+
+    # Create WebLoader
+    loader = wds.WebLoader(
+        dataset,
+        batch_size=None,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers if num_workers > 0 else False,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+    )
+
+    # Shuffle samples, then batch
+    if split == "train" or split == "all":
+        loader = loader.shuffle(shuffle_buffer_size).batched(batch_size, collation_fn=default_collate_fn)
+    else:
+        loader = loader.batched(batch_size, collation_fn=default_collate_fn)
+
+    # Set epoch length explicitly for all splits
+    num_batches = dataset.split_sample_count // batch_size
+    loader = loader.with_epoch(num_batches)
+
+    if split == "train":
+        print(f"[RLDataLoader] WebLoader ready: batch_size={batch_size}, {num_batches} batches/epoch (with_epoch set)")
+    else:
+        print(f"[RLDataLoader] WebLoader ready: batch_size={batch_size}, ~{num_batches} batches/epoch")
+
+    return loader
+
+
 def fast_collate_fn(batch):
     if isinstance(batch, dict):
         return batch
@@ -753,6 +854,6 @@ def fast_collate_fn(batch):
         if len(batch) == 1 and isinstance(batch[0], dict):
             if "bev" in batch[0] and torch.is_tensor(batch[0]["bev"]) and batch[0]["bev"].ndim == 4:
                 return batch[0]
-                
+
         return default_collate_fn(batch)
     return batch

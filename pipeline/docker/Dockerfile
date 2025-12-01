@@ -24,5 +24,4 @@ RUN pip install --upgrade pip && pip install -r /app/pipeline/requirements.txt
 # project code (entire Baby-FSD root including data/ and pipeline/)
 COPY . /app
 
-# default command: training entry; Compose or CLI can override freely
 CMD ["python", "pipeline/scripts/train.py"]

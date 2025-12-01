@@ -1,18 +1,11 @@
-# Enables Hydra's Optuna Sweeper for multirun (-m)
-# Usage:
-#   python scripts/search.py -m +hpo=optuna +hpo.space=bc_basic
-# or
-#   docker compose run --rm trainer -m +hpo=optuna +hpo.space=ppo_basic
-
-# activate the sweeper
 hydra:
   sweeper:
     _target_: hydra_plugins.hydra_optuna_sweeper.optuna_sweeper.OptunaSweeper
-    storage: null              # or sqlite:///outputs/optuna.db
+    storage: null              
     study_name: "${exp.name}"
     n_trials: 20
     n_jobs: 1
-    direction: ${hpo.direction}  # "maximize" or "minimize"
+    direction: ${hpo.direction}  
     sampler:
       _target_: optuna.samplers.TPESampler
       seed: ${seed.seed}
@@ -23,8 +16,7 @@ hydra:
       n_warmup_steps: 0
     params: ${hpo.params}
 
-# space selector indirection (so you can pick a space file)
 hpo:
-  direction: "maximize"        # override per space file
-  params: {}                   # override per space file
-  objective_key: ""            # override per space file (e.g., eval/return_mean)
+  direction: "maximize"        
+  params: {}                   
+  objective_key: ""            

@@ -691,25 +691,29 @@ def main():
                 ep_frames += 1
 
             # After episode loop, capture extra horizon ticks to fill futures for tail frames
-            for _ in range(horizon_ticks):
-                world.tick()
-                snapshot = world.get_snapshot()
-                sim_time = float(getattr(getattr(snapshot, "timestamp", None), "elapsed_seconds", ep_frames * fixed_dt))
-                speed_mps, _ = get_ego_state(ego)
-                ego_tf = ego.get_transform()
-                futures.add(sim_time, ego_tf, speed_mps)
-                ep_frames += 1
+            try:
+                for _ in range(horizon_ticks):
+                    world.tick()
+                    snapshot = world.get_snapshot()
+                    sim_time = float(getattr(getattr(snapshot, "timestamp", None), "elapsed_seconds", ep_frames * fixed_dt))
+                    speed_mps, _ = get_ego_state(ego)
+                    ego_tf = ego.get_transform()
+                    futures.add(sim_time, ego_tf, speed_mps)
+                    ep_frames += 1
+            except Exception as e:
+                LOG.warning("    Error capturing horizon ticks: %s (may lose tail frames)", e)
 
             # After episode loop: flush remaining pending frames
             # Process any frames that have sufficient future data
-            LOG.info("  Writing %d frames to disk...", len(pending))
+            LOG.info("  Processing %d pending frames for writing...", len(pending))
             frames_written = 0
             frames_skipped = 0
-            
+            total_pending = len(pending)
+
             # For HDF5, batch episode frames
             if backend == "hdf5":
                 episode_frames = []
-            
+
             while pending:
                 rec = pending.popleft()
                 # Check if we have enough future data
@@ -807,12 +811,19 @@ def main():
 
                 # HDF5 backend: batch frames for episode-level write
                 if backend == "hdf5":
-                    frame_dict = build_hdf5_frame(rec, wp_future, vel_future, K, N, 64)
-                    episode_frames.append(frame_dict)
-                    frames_written += 1
-                    if frames_written % 100 == 0:
-                        LOG.info("    Progress: %d frames processed...", frames_written)
-                    continue
+                    try:
+                        frame_dict = build_hdf5_frame(rec, wp_future, vel_future, K, N, 64)
+                        episode_frames.append(frame_dict)
+                        frames_written += 1
+                        if frames_written % 100 == 0:
+                            pct = (frames_written / total_pending) * 100 if total_pending > 0 else 0
+                            LOG.info("    Progress: %d/%d frames processed (%.1f%%)...", frames_written, total_pending, pct)
+                        continue
+                    except Exception as e:
+                        LOG.error("    Error building HDF5 frame for frame_id=%d: %s", rec.get("frame_id", -1), e)
+                        import traceback
+                        traceback.print_exc()
+                        raise
                 
                 # Legacy Parquet/DuckDB backends below
                 # Frames row
@@ -1059,8 +1070,16 @@ def main():
             
             # For HDF5: write episode batch
             if backend == "hdf5" and episode_frames:
-                hdf5_writer.append_episode(episode_frames)
-                frames_rows += len(episode_frames)
+                try:
+                    LOG.info("    Writing %d frames to HDF5...", len(episode_frames))
+                    hdf5_writer.append_episode(episode_frames)
+                    frames_rows += len(episode_frames)
+                    LOG.info("    HDF5 write complete (%d frames)", len(episode_frames))
+                except Exception as e:
+                    LOG.error("    FATAL: HDF5 write failed: %s", e)
+                    import traceback
+                    traceback.print_exc()
+                    raise RuntimeError(f"Failed to write episode to HDF5: {e}") from e
             
             # Per-episode basic distribution metrics
             avg_speed = ep_stats["speed_sum"] / max(1, ep_stats["speed_count"])

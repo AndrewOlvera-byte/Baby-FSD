@@ -2,6 +2,8 @@
 # Use torch/vision/audio from the base image to keep CUDA compatibility
 # Align with the pytorch/pytorch:2.7.0-cuda12.8-cudnn9 base image (ships torchvision 0.22.x)
 torchvision>=0.22.0,<0.23.0
+torchrl>=0.8.0  # TorchRL for offline RL training (compatible with PyTorch 2.7.0+)
+tensordict>=0.7.0  # Required by TorchRL
 
 # === Testing ===
 pytest>=7.0.0

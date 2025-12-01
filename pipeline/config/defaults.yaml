@@ -14,7 +14,7 @@ hydra:
   output_subdir: null
 
 exp:
-  name: "cifar10_train"
-  desc: "CIFAR-10 supervised training"
-  tags: ["sl", "cifar10", "resnet50"]
+  name: "bc_train"
+  desc: "Behavior Cloning training"
+  tags: ["bc", "behavior_cloning"]
   notes: ""

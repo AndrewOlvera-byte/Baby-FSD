@@ -1,42 +1,32 @@
-# Connection
 host: "10.0.0.121"
 port: 2000
 tm_port: 8000
 
-# Output
 out_dir: "data/RL_v1"
 
-# Sim timing
-fixed_dt: 0.05         # 20 Hz
-future_dt: 0.2         # label spacing
+fixed_dt: 0.05         
+future_dt: 0.2         
 
-# Labels / tokens
-K: 32                  # route points ahead (ego frame)
-N: 12                  # future waypoints/vels
+K: 32                  
+N: 12                  
 
-# Extraction windows
 actor_radius: 40.0
 window_m: 60.0
 
-# Performance
 no_rendering: false
 shard_rows: 1000
 max_frames: 550000
 
-# Agent behavior
 behavior: "normal"     # cautious | normal | aggressive
 wheelbase_m: 2.875
 
-# Episodes and traffic
-episodes: 200
+episodes: 1
 episode_max_frames: 2750
 npc_count: 40
 
-# Visual debug
-spectator_follow: false
+spectator_follow: true
 spectator_mode: "chase"
 
-# BEV configuration
 bev:
   meters_x: 80.0
   meters_y: 60.0
@@ -47,7 +37,6 @@ bev:
   drivable_thickness_m: 6.0
   actor_radius_m: 1.2
 
-# Rewards
 rewards:
   progress_weight: 0.1
   collision_penalty: -5.0
@@ -59,21 +48,18 @@ rewards:
   clip_max: 10.0
   max_stopline_dist: 8.0
 
-# Action noise for data diversity
 noise:
   probability: 0.2
   steer_std: 0.1
   throttle_std: 0.05
   brake_std: 0.05
 
-# Termination conditions
 termination:
   collision: true
   offroad: true
   completion: true
   completion_goal_dist: 5.0
 
-# Validation thresholds
 validation:
   max_speed_mps: 50.0
   max_abs_accel_mps2: 12.0
@@ -82,7 +68,6 @@ validation:
   require_futures_per_frame: true
   require_objects_per_actor: true
 
-# Storage backend
 storage:
   backend: hdf5
   episodes_per_set: 5

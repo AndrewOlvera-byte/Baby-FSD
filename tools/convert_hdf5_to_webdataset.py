@@ -1,91 +1,90 @@
-"""
-Convert HDF5 BC datasets to WebDataset tar shard format.
+"""Convert HDF5 datasets to WebDataset tar shards."""
 
-WebDataset format eliminates per-sample decompression overhead and enables
-efficient batch-level data loading for GPU training.
-
-Usage:
-    python tools/convert_hdf5_to_webdataset.py \
-        --input_dir data/BC_v2/run-YYYYMMDD-HHMMSS \
-        --output_dir data/BC_v2/run-YYYYMMDD-HHMMSS-wds \
-        --samples_per_shard 1000
-"""
-
-import os
-import sys
 import argparse
 import glob
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-import json
-from datetime import datetime
-from multiprocessing import Pool, cpu_count
-from functools import partial
 import heapq
+import io
+import json
+import os
+import sys
+import tarfile
 import threading
 import traceback
+from datetime import datetime
+from multiprocessing import Pool, cpu_count
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
+import h5py
+import hdf5plugin  # noqa: F401  # registers compression filter
 import numpy as np
-import torch
-import tarfile
 from tqdm import tqdm
 
-try:
-    import h5py
-    import hdf5plugin  # Register LZ4 compression filter
-    HDF5_AVAILABLE = True
-except ImportError:
-    HDF5_AVAILABLE = False
-    print("Error: h5py and hdf5plugin are required. Install with: pip install h5py hdf5plugin")
-    sys.exit(1)
+# Required fields for all datasets (BC and RL)
+BASE_KEYS = [
+    "frame_id",
+    "episode_id",
+    "ego_vec",
+    "bev",
+    "route",
+    "objects",
+    "object_mask",
+    "future_xy",
+    "future_v",
+    "future_mask",
+]
+
+# Optional fields for offline RL datasets
+# These are automatically detected and included if present in the HDF5 files
+OPTIONAL_KEYS = [
+    "reward_raw",
+    "reward_clipped",
+    "reward_normalized",
+    "reward_progress",
+    "reward_collision",
+    "reward_offroad",
+    "reward_violation",
+    "reward_comfort",
+    "reward_completion",
+    "reward_mean",
+    "reward_std",
+    "noise_injected",
+    "action_steer",
+    "action_throttle",
+    "action_brake",
+    "route_progress_delta",
+    "done",
+    "discount",
+]
 
 
-def read_hdf5_sample(f: h5py.File, idx: int) -> Dict[str, np.ndarray]:
-    """
-    Read a single sample from HDF5 file.
-    
-    Args:
-        f: Open HDF5 file handle
-        idx: Sample index within file
-        
-    Returns:
-        Dict with all sample data as numpy arrays
-    """
-    return {
-        "frame_id": np.array(f["frame_id"][idx], dtype=np.int64),
-        "episode_id": np.array(f["episode_id"][idx], dtype=np.int16),
-        "ego_vec": f["ego_vec"][idx].astype(np.float32),
-        "bev": f["bev"][idx].astype(np.float32),
-        "route": f["route"][idx].astype(np.float32),
-        "objects": f["objects"][idx].astype(np.float32),
-        "object_mask": f["object_mask"][idx].astype(np.float32),
-        "future_xy": f["future_xy"][idx].astype(np.float32),
-        "future_v": f["future_v"][idx].astype(np.float32),
-        "future_mask": f["future_mask"][idx].astype(np.float32),
-    }
+def read_hdf5_sample(f: h5py.File, idx: int, fields: List[str]) -> Dict[str, np.ndarray]:
+    """Read a single sample from HDF5 file."""
+    sample: Dict[str, np.ndarray] = {}
+
+    for key in fields:
+        arr = f[key][idx]
+
+        if key in {"frame_id"}:
+            sample[key] = np.array(arr, dtype=np.int64)
+        elif key in {"episode_id"}:
+            sample[key] = np.array(arr, dtype=np.int16)
+        elif key in {"noise_injected", "done"}:
+            sample[key] = np.array(arr, dtype=np.bool_)
+        else:
+            sample[key] = np.array(arr, dtype=np.float32)
+
+    return sample
 
 
 def write_sample_to_tar(tar: tarfile.TarFile, sample_idx: int, sample: Dict[str, np.ndarray]):
-    """
-    Write a single sample to tar archive.
-    
-    Args:
-        tar: Open tarfile.TarFile
-        sample_idx: Global sample index (for naming)
-        sample: Sample data dict
-    """
-    # Write each array as a separate file in the tar
-    # Format: {sample_idx:08d}.{key}.npy
     base_name = f"{sample_idx:08d}"
     
     for key, value in sample.items():
-        # Create in-memory numpy array file
-        import io
         buffer = io.BytesIO()
         np.save(buffer, value, allow_pickle=False)
         buffer.seek(0)
         
-        # Add to tar
         info = tarfile.TarInfo(name=f"{base_name}.{key}.npy")
         info.size = len(buffer.getvalue())
         tar.addfile(info, buffer)
@@ -93,17 +92,7 @@ def write_sample_to_tar(tar: tarfile.TarFile, sample_idx: int, sample: Dict[str,
 
 def write_shard_metadata(tar: tarfile.TarFile, shard_idx: int, first_sample_idx: int, 
                         last_sample_idx: int, sample_count: int):
-    """
-    Write per-shard metadata to tar archive.
-    
-    Args:
-        tar: Open tarfile.TarFile
-        shard_idx: Shard index
-        first_sample_idx: First sample index in this shard
-        last_sample_idx: Last sample index in this shard
-        sample_count: Number of samples in this shard
-    """
-    import io
+    """Write per-shard metadata to the tar archive."""
     metadata = {
         "shard_idx": shard_idx,
         "first_sample_idx": first_sample_idx,
@@ -121,27 +110,12 @@ def write_shard_metadata(tar: tarfile.TarFile, shard_idx: int, first_sample_idx:
     tar.addfile(info, buffer)
 
 
-def _read_samples_worker(args: Tuple[str, int, int, int]) -> List[Tuple[int, Dict[str, np.ndarray]]]:
-    """
-    Worker function to read a batch of samples from HDF5 file.
-    
-    Args:
-        args: Tuple of (file_path, start_idx, end_idx, global_start_idx)
-        
-    Returns:
-        List of (global_sample_idx, sample_dict) tuples
-    """
-    file_path, start_idx, end_idx, global_start_idx = args
-    
-    import h5py
-    import hdf5plugin  # Register compression filter in worker
-    
-    # Normalize path for worker process (handles WSL/Windows path issues)
+def _read_samples_worker(args: Tuple[str, int, int, int, List[str]]) -> List[Tuple[int, Dict[str, np.ndarray]]]:
+    file_path, start_idx, end_idx, global_start_idx, fields = args
     file_path = os.path.abspath(os.path.normpath(file_path))
-    
     samples = []
+
     try:
-        # Validate file exists and is a file
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"HDF5 file not found in worker: {file_path}")
         if not os.path.isfile(file_path):
@@ -150,7 +124,7 @@ def _read_samples_worker(args: Tuple[str, int, int, int]) -> List[Tuple[int, Dic
         with h5py.File(file_path, "r") as f:
             for local_idx in range(start_idx, end_idx):
                 global_idx = global_start_idx + (local_idx - start_idx)
-                sample = read_hdf5_sample(f, local_idx)
+                sample = read_hdf5_sample(f, local_idx, fields)
                 samples.append((global_idx, sample))
     except Exception as e:
         error_msg = f"[Worker] Error reading {file_path}[{start_idx}:{end_idx}]: {e}\n{traceback.format_exc()}"
@@ -232,25 +206,30 @@ def convert_hdf5_to_webdataset(
     file_lengths = []
     file_cumsum = [0]
     
-    # Validate HDF5 files have consistent schema
-    expected_keys = ["frame_id", "episode_id", "ego_vec", "bev", "route", 
-                     "objects", "object_mask", "future_xy", "future_v", "future_mask"]
-    
     for fpath in tqdm(h5_files, desc="Indexing files"):
-        # Normalize path
         fpath = os.path.abspath(os.path.normpath(fpath))
         try:
             with h5py.File(fpath, "r") as f:
-                # Validate all required keys exist
-                missing_keys = [key for key in expected_keys if key not in f.keys()]
+                available_keys = set(f.keys())
+                missing_keys = [key for key in BASE_KEYS if key not in available_keys]
                 if missing_keys:
                     raise IOError(f"HDF5 file {fpath} missing required keys: {missing_keys}")
-                
+
+                # Validate objects array has correct shape (11 features)
+                if "objects" in available_keys:
+                    obj_shape = f["objects"].shape
+                    if len(obj_shape) >= 2 and obj_shape[-1] != 11:
+                        raise IOError(
+                            f"HDF5 file {fpath} has invalid objects array shape: {obj_shape}. "
+                            f"Expected 11 features (type_id, x, y, sin_yaw, cos_yaw, length, width, vx, vy, oncoming, priority), "
+                            f"but got {obj_shape[-1]} features. This may indicate missing sin_yaw/cos_yaw fields."
+                        )
+
                 n_samples = len(f["frame_id"])
                 if n_samples == 0:
                     print(f"[WARNING] HDF5 file {fpath} contains 0 samples, skipping")
                     continue
-                    
+
                 file_lengths.append(n_samples)
                 file_cumsum.append(file_cumsum[-1] + n_samples)
         except Exception as e:
@@ -260,9 +239,14 @@ def convert_hdf5_to_webdataset(
     print(f"[Convert] Total samples: {total_samples:,}")
     
     # Read metadata from first file
+    fields: List[str] = []
     first_file = os.path.abspath(os.path.normpath(h5_files[0]))
     try:
         with h5py.File(first_file, "r") as f:
+            available_keys = set(f.keys())
+            fields = [k for k in BASE_KEYS if k in available_keys]
+            fields.extend([k for k in OPTIONAL_KEYS if k in available_keys])
+
             metadata = {
                 "K": int(f.attrs.get("K", 32)),
                 "N_future": int(f.attrs.get("N_future", 12)),
@@ -273,6 +257,7 @@ def convert_hdf5_to_webdataset(
                 "version": f.attrs.get("version", "2.0"),
                 "norms_version": int(f.attrs.get("norms_version", 1)),
                 "run_id": f.attrs.get("run_id", "").decode() if isinstance(f.attrs.get("run_id", ""), bytes) else f.attrs.get("run_id", ""),
+                "fields": fields,
             }
     except Exception as e:
         raise IOError(f"Failed to read metadata from {first_file}: {e}")
@@ -280,6 +265,7 @@ def convert_hdf5_to_webdataset(
     # Write metadata file (include conversion settings)
     metadata["samples_per_shard"] = samples_per_shard
     metadata["total_samples"] = total_samples
+    metadata["shard_pattern"] = shard_pattern
     metadata_path = output_dir / "metadata.json"
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
@@ -307,14 +293,13 @@ def convert_hdf5_to_webdataset(
             with h5py.File(h5_path, "r") as f:
                 n_samples = len(f["frame_id"])
             
-            # Chunk size: at least 100 samples, or split file into ~num_workers*2 chunks
             chunk_size = max(100, n_samples // (num_workers * 2))
             file_start_idx = file_cumsum[file_idx]
             
             for start in range(0, n_samples, chunk_size):
                 end = min(start + chunk_size, n_samples)
                 global_start_idx = file_start_idx + start
-                work_items.append((h5_path, start, end, global_start_idx))
+                work_items.append((h5_path, start, end, global_start_idx, fields))
         
         # Stream samples as chunks arrive, write in order using priority queue (memory-efficient)
         print(f"[Convert] Reading {len(work_items)} chunks in parallel (streaming mode)...")
@@ -383,7 +368,6 @@ def convert_hdf5_to_webdataset(
         
         # Process chunks in parallel, write samples incrementally
         with Pool(processes=num_workers) as pool:
-            # Use imap for ordered processing (chunks may arrive out of order)
             async_results = pool.imap(_read_samples_worker, work_items)
             
             # Process results as they arrive
@@ -476,7 +460,7 @@ def convert_hdf5_to_webdataset(
                             tqdm.write(f"[Convert] Writing shard {current_shard_idx-1}: {shard_name}")
                         
                         # Read sample from HDF5
-                        sample = read_hdf5_sample(f, local_idx)
+                        sample = read_hdf5_sample(f, local_idx, fields)
                         
                         # Write to tar
                         write_sample_to_tar(current_tar, global_sample_idx, sample)
@@ -506,7 +490,7 @@ def convert_hdf5_to_webdataset(
     return stats
 
 
-def read_sample_from_shard(shard_path: str, sample_idx: int) -> Optional[Dict[str, np.ndarray]]:
+def read_sample_from_shard(shard_path: str, sample_idx: int, fields: List[str]) -> Optional[Dict[str, np.ndarray]]:
     """
     Read a single sample from a WebDataset shard.
     
@@ -518,19 +502,14 @@ def read_sample_from_shard(shard_path: str, sample_idx: int) -> Optional[Dict[st
         Dict with sample data, or None if not found
     """
     base_name = f"{sample_idx:08d}"
-    sample = {}
-    required_keys = ["frame_id", "episode_id", "ego_vec", "bev", "route", 
-                     "objects", "object_mask", "future_xy", "future_v", "future_mask"]
+    sample: Dict[str, np.ndarray] = {}
     
     try:
-        import io
-        # Normalize path
         shard_path = os.path.abspath(os.path.normpath(shard_path))
         with tarfile.open(shard_path, "r") as tar:
-            # Build member name map for faster lookup
             members = {m.name: m for m in tar.getmembers()}
             
-            for key in required_keys:
+            for key in fields:
                 member_name = f"{base_name}.{key}.npy"
                 if member_name not in members:
                     return None
@@ -539,13 +518,12 @@ def read_sample_from_shard(shard_path: str, sample_idx: int) -> Optional[Dict[st
                 if buffer is None:
                     return None
                 
-                # Read bytes and load from BytesIO (np.load needs a file-like with fileno)
                 data_bytes = buffer.read()
                 sample[key] = np.load(io.BytesIO(data_bytes))
-    except (KeyError, tarfile.TarError, IOError) as e:
+    except (KeyError, tarfile.TarError, IOError):
         return None
     
-    return sample if len(sample) == len(required_keys) else None
+    return sample if len(sample) == len(fields) else None
 
 
 def verify_conversion(
@@ -581,6 +559,7 @@ def verify_conversion(
         metadata = json.load(f)
     
     samples_per_shard = metadata.get("samples_per_shard", 1000)
+    fields = metadata.get("fields", BASE_KEYS)
     
     # Build HDF5 index
     h5_files = sorted(glob.glob(str(input_dir / "*.h5")))
@@ -646,10 +625,10 @@ def verify_conversion(
         local_h5_idx = sample_idx - file_cumsum[file_idx]
         
         with h5py.File(h5_files[file_idx], "r") as f:
-            h5_sample = read_hdf5_sample(f, local_h5_idx)
+            h5_sample = read_hdf5_sample(f, local_h5_idx, fields)
         
         # Read from WebDataset shard
-        wds_sample = read_sample_from_shard(shard_path, sample_idx)
+        wds_sample = read_sample_from_shard(shard_path, sample_idx, fields)
         
         if wds_sample is None:
             errors.append(f"Sample {sample_idx}: Not found in shard {shard_idx}")
@@ -669,7 +648,6 @@ def verify_conversion(
                 errors.append(f"Sample {sample_idx}, key '{key}': Shape mismatch {h5_arr.shape} vs {wds_arr.shape}")
                 continue
             
-            # Check dtype for integer fields (exact match required)
             if key in ["frame_id", "episode_id"]:
                 if h5_arr.dtype != wds_arr.dtype:
                     errors.append(f"Sample {sample_idx}, key '{key}': Dtype mismatch {h5_arr.dtype} vs {wds_arr.dtype}")
@@ -678,6 +656,12 @@ def verify_conversion(
                 if not np.array_equal(h5_arr, wds_arr):
                     errors.append(f"Sample {sample_idx}, key '{key}': Value mismatch (integers must match exactly)")
                     continue
+            elif key in ["noise_injected", "done"]:
+                if h5_arr.dtype != wds_arr.dtype:
+                    errors.append(f"Sample {sample_idx}, key '{key}': Dtype mismatch {h5_arr.dtype} vs {wds_arr.dtype}")
+                    continue
+                if not np.array_equal(h5_arr, wds_arr):
+                    errors.append(f"Sample {sample_idx}, key '{key}': Value mismatch (bool fields must match)")
             else:
                 # Check values (allow small floating point differences for float arrays)
                 max_diff = np.abs(h5_arr.astype(np.float32) - wds_arr.astype(np.float32)).max()
@@ -744,11 +728,6 @@ def main():
     )
     
     args = parser.parse_args()
-    
-    if not HDF5_AVAILABLE:
-        print("Error: h5py is required. Install with: pip install h5py")
-        sys.exit(1)
-    
     # Determine number of workers
     num_workers = args.num_workers
     if num_workers == 0:
@@ -801,4 +780,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

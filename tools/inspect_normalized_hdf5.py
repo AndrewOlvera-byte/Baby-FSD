@@ -1,12 +1,20 @@
 """
-Inspect and print normalized values from HDF5 BC dataset.
+Inspect and print normalized values from HDF5 BC or RL dataset.
 
 Reads the first N steps from HDF5 files, normalizes them using norms.py,
-and prints statistics and sample values for inspection.
+validates dataset integrity, and prints statistics and sample values for inspection.
 
 Usage:
+    # BC dataset
     python tools/inspect_normalized_hdf5.py \
         --input_dir data/BC_v2/run-YYYYMMDD-HHMMSS \
+        --mode bc \
+        --num_steps 100
+
+    # Offline RL dataset
+    python tools/inspect_normalized_hdf5.py \
+        --input_dir data/RL_v1/run-YYYYMMDD-HHMMSS \
+        --mode rl \
         --num_steps 100
 """
 
@@ -39,18 +47,55 @@ from data.norms import (
 )
 
 
-def read_hdf5_sample(f: h5py.File, idx: int) -> Dict[str, np.ndarray]:
+# Expected fields for each dataset mode
+BASE_FIELDS = [
+    "frame_id",
+    "episode_id",
+    "ego_vec",
+    "bev",
+    "route",
+    "objects",
+    "object_mask",
+    "future_xy",
+    "future_v",
+    "future_mask",
+]
+
+RL_EXTRA_FIELDS = [
+    "reward_raw",
+    "reward_clipped",
+    "reward_normalized",
+    "reward_progress",
+    "reward_collision",
+    "reward_offroad",
+    "reward_violation",
+    "reward_comfort",
+    "reward_completion",
+    "reward_mean",
+    "reward_std",
+    "noise_injected",
+    "action_steer",
+    "action_throttle",
+    "action_brake",
+    "route_progress_delta",
+    "done",
+    "discount",
+]
+
+
+def read_hdf5_sample(f: h5py.File, idx: int, mode: str = "bc") -> Dict[str, np.ndarray]:
     """
     Read a single sample from HDF5 file.
-    
+
     Args:
         f: Open HDF5 file handle
         idx: Sample index within file
-        
+        mode: Dataset mode ("bc" or "rl")
+
     Returns:
         Dict with all sample data as numpy arrays
     """
-    return {
+    sample = {
         "frame_id": f["frame_id"][idx],
         "episode_id": f["episode_id"][idx],
         "ego_vec": f["ego_vec"][idx].astype(np.float32),
@@ -63,14 +108,29 @@ def read_hdf5_sample(f: h5py.File, idx: int) -> Dict[str, np.ndarray]:
         "future_mask": f["future_mask"][idx].astype(np.float32),
     }
 
+    # Add RL-specific fields if in RL mode
+    if mode == "rl":
+        for field in RL_EXTRA_FIELDS:
+            if field in f:
+                sample[field] = f[field][idx]
+                if field in ["noise_injected", "done"]:
+                    sample[field] = np.array(sample[field], dtype=np.bool_)
+                elif field in ["episode_id"]:
+                    sample[field] = np.array(sample[field], dtype=np.int16)
+                else:
+                    sample[field] = np.array(sample[field], dtype=np.float32)
 
-def normalize_sample(sample: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
+    return sample
+
+
+def normalize_sample(sample: Dict[str, np.ndarray], mode: str = "bc") -> Dict[str, torch.Tensor]:
     """
     Normalize a sample using norms.py functions.
-    
+
     Args:
         sample: Dict with numpy arrays
-        
+        mode: Dataset mode ("bc" or "rl")
+
     Returns:
         Dict with normalized torch tensors
     """
@@ -83,14 +143,14 @@ def normalize_sample(sample: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
     future_xy = torch.from_numpy(sample["future_xy"].astype(np.float32))
     future_v = torch.from_numpy(sample["future_v"].astype(np.float32))
     future_mask = torch.from_numpy(sample["future_mask"].astype(np.float32))
-    
+
     # Normalize (ego_vec is already normalized during collection)
     bev_norm = normalize_bev(bev)
     route_norm = normalize_route_points(route)
     objects_norm = normalize_object_tokens(objects)
     future_xy_norm, future_v_norm = normalize_futures(future_xy, future_v)
-    
-    return {
+
+    result = {
         "frame_id": sample["frame_id"],
         "episode_id": sample["episode_id"],
         "ego_vec": ego_vec,
@@ -102,6 +162,17 @@ def normalize_sample(sample: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
         "future_v": future_v_norm,
         "future_mask": future_mask,
     }
+
+    # Pass through RL-specific fields (no normalization needed for rewards/actions)
+    if mode == "rl":
+        for field in RL_EXTRA_FIELDS:
+            if field in sample:
+                if field in ["noise_injected", "done"]:
+                    result[field] = torch.from_numpy(sample[field])
+                else:
+                    result[field] = torch.from_numpy(sample[field].astype(np.float32))
+
+    return result
 
 
 def print_statistics(name: str, tensor: torch.Tensor, indent: int = 0):
@@ -129,30 +200,81 @@ def print_statistics(name: str, tensor: torch.Tensor, indent: int = 0):
             print(f"{indent_str}    [{i}]: {tensor[i].tolist()}")
 
 
-def inspect_hdf5_dataset(input_dir: str, num_steps: int = 100):
+def validate_hdf5_fields(f: h5py.File, mode: str) -> List[str]:
+    """
+    Validate that HDF5 file contains expected fields for the given mode.
+
+    Args:
+        f: Open HDF5 file handle
+        mode: Dataset mode ("bc" or "rl")
+
+    Returns:
+        List of validation errors (empty if valid)
+    """
+    errors = []
+    available_keys = set(f.keys())
+
+    # Check base fields
+    for field in BASE_FIELDS:
+        if field not in available_keys:
+            errors.append(f"Missing required base field: {field}")
+
+    # Check RL-specific fields if in RL mode
+    if mode == "rl":
+        for field in RL_EXTRA_FIELDS:
+            if field not in available_keys:
+                errors.append(f"Missing required RL field: {field}")
+
+    # Validate object array has correct number of features (11)
+    if "objects" in available_keys:
+        obj_shape = f["objects"].shape
+        if len(obj_shape) >= 2 and obj_shape[-1] != 11:
+            errors.append(f"Object array has wrong feature dimension: {obj_shape[-1]} (expected 11)")
+
+    return errors
+
+
+def inspect_hdf5_dataset(input_dir: str, num_steps: int = 100, mode: str = "bc"):
     """
     Read and normalize first N steps from HDF5 dataset.
-    
+
     Args:
         input_dir: Directory containing .h5 files
         num_steps: Number of steps to read and inspect
+        mode: Dataset mode ("bc" or "rl")
     """
+    if mode not in ["bc", "rl"]:
+        raise ValueError(f"Invalid mode: {mode}. Must be 'bc' or 'rl'")
+
     input_dir = Path(input_dir)
     if not input_dir.exists():
         raise FileNotFoundError(f"Input directory not found: {input_dir}")
-    
+
     # Find all HDF5 files
     h5_files = sorted(glob.glob(str(input_dir / "*.h5")))
     if not h5_files:
         raise FileNotFoundError(f"No .h5 files found in {input_dir}")
-    
+
     print("=" * 80)
-    print("HDF5 Normalized Values Inspector")
+    print(f"HDF5 Normalized Values Inspector (Mode: {mode.upper()})")
     print("=" * 80)
     print(f"Input directory: {input_dir}")
     print(f"Found {len(h5_files)} HDF5 file(s)")
     print(f"Reading first {num_steps} steps")
     print("=" * 80)
+
+    # Validate first file
+    print(f"\nValidating dataset schema...")
+    with h5py.File(h5_files[0], "r") as f:
+        validation_errors = validate_hdf5_fields(f, mode)
+        if validation_errors:
+            print("\n[ERROR] Schema validation failed:")
+            for error in validation_errors:
+                print(f"  - {error}")
+            raise ValueError(f"Dataset does not match expected {mode.upper()} schema")
+        else:
+            print(f"  ✓ Schema validation passed ({mode.upper()} mode)")
+            print(f"  ✓ Available fields: {sorted(f.keys())}")
     
     samples_read = 0
     normalized_samples = []
@@ -170,13 +292,13 @@ def inspect_hdf5_dataset(input_dir: str, num_steps: int = 100):
             
             # Read up to num_steps samples
             samples_to_read = min(n_samples, num_steps - samples_read)
-            
+
             for local_idx in range(samples_to_read):
-                sample = read_hdf5_sample(f, local_idx)
-                normalized = normalize_sample(sample)
+                sample = read_hdf5_sample(f, local_idx, mode=mode)
+                normalized = normalize_sample(sample, mode=mode)
                 normalized_samples.append(normalized)
                 samples_read += 1
-                
+
                 if samples_read >= num_steps:
                     break
     
@@ -319,7 +441,67 @@ def inspect_hdf5_dataset(input_dir: str, num_steps: int = 100):
         print(f"  Samples with very low X variation (<0.0001): {(var_x_tensor < 0.0001).sum().item()}/{len(var_x_tensor)}")
         print(f"  Samples with very low Y variation (<0.00001): {(var_y_tensor < 0.00001).sum().item()}/{len(var_y_tensor)}")
     print()
-    
+
+    # RL-specific statistics
+    if mode == "rl":
+        print(f"{'=' * 80}")
+        print("OFFLINE RL SPECIFIC ANALYSIS:")
+        print(f"{'=' * 80}\n")
+
+        # Reward statistics
+        if "reward_clipped" in normalized_samples[0]:
+            rewards = torch.stack([s["reward_clipped"] for s in normalized_samples])
+            print("Reward Distribution (clipped):")
+            print(f"  Min: {rewards.min().item():.6f}")
+            print(f"  Max: {rewards.max().item():.6f}")
+            print(f"  Mean: {rewards.mean().item():.6f}")
+            print(f"  Std: {rewards.std().item():.6f}")
+            print(f"  Median: {torch.median(rewards).item():.6f}")
+
+            # Reward histogram
+            reward_hist = torch.histc(rewards, bins=20, min=rewards.min(), max=rewards.max())
+            reward_bins = torch.linspace(rewards.min(), rewards.max(), 21)
+            print("  Histogram (20 bins):")
+            for i in range(min(10, len(reward_hist))):  # Show first 10 bins
+                count = int(reward_hist[i].item())
+                if count > 0:
+                    pct = (count / len(rewards)) * 100
+                    bar = "█" * int(pct / 2)
+                    print(f"    [{reward_bins[i]:.2f}-{reward_bins[i+1]:.2f}): {count:4d} ({pct:5.1f}%) {bar}")
+            print()
+
+        # Reward components
+        if "reward_progress" in normalized_samples[0]:
+            reward_progress = torch.stack([s["reward_progress"] for s in normalized_samples])
+            reward_collision = torch.stack([s["reward_collision"] for s in normalized_samples])
+            reward_offroad = torch.stack([s["reward_offroad"] for s in normalized_samples])
+            reward_violation = torch.stack([s["reward_violation"] for s in normalized_samples])
+            reward_comfort = torch.stack([s["reward_comfort"] for s in normalized_samples])
+
+            print("Reward Components:")
+            print(f"  Progress:   mean={reward_progress.mean().item():.6f}, std={reward_progress.std().item():.6f}")
+            print(f"  Collision:  mean={reward_collision.mean().item():.6f}, sum={reward_collision.sum().item():.1f}, events={(reward_collision != 0).sum().item()}")
+            print(f"  Offroad:    mean={reward_offroad.mean().item():.6f}, sum={reward_offroad.sum().item():.1f}, events={(reward_offroad != 0).sum().item()}")
+            print(f"  Violation:  mean={reward_violation.mean().item():.6f}, sum={reward_violation.sum().item():.1f}, events={(reward_violation != 0).sum().item()}")
+            print(f"  Comfort:    mean={reward_comfort.mean().item():.6f}, std={reward_comfort.std().item():.6f}")
+            print()
+
+        # Action noise statistics
+        if "noise_injected" in normalized_samples[0]:
+            noise_flags = torch.stack([s["noise_injected"] for s in normalized_samples])
+            noise_count = noise_flags.sum().item()
+            noise_pct = (noise_count / len(noise_flags)) * 100
+            print(f"Noise Injection: {noise_count}/{len(noise_flags)} samples ({noise_pct:.1f}%)")
+            print()
+
+        # Terminal states
+        if "done" in normalized_samples[0]:
+            done_flags = torch.stack([s["done"] for s in normalized_samples])
+            done_count = done_flags.sum().item()
+            done_pct = (done_count / len(done_flags)) * 100
+            print(f"Terminal States: {done_count}/{len(done_flags)} samples ({done_pct:.1f}%)")
+            print()
+
     # Print detailed sample values for first few samples
     print(f"\n{'=' * 80}")
     print(f"DETAILED SAMPLE VALUES (first 5 samples):")
@@ -405,7 +587,7 @@ def inspect_hdf5_dataset(input_dir: str, num_steps: int = 100):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Inspect normalized values from HDF5 BC dataset",
+        description="Inspect normalized values from HDF5 BC or RL dataset",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -415,20 +597,27 @@ def main():
         help="Input directory containing .h5 files",
     )
     parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["bc", "rl"],
+        default="bc",
+        help="Dataset mode: 'bc' for behavioral cloning, 'rl' for offline RL",
+    )
+    parser.add_argument(
         "--num_steps",
         type=int,
         default=100,
         help="Number of steps to read and inspect",
     )
-    
+
     args = parser.parse_args()
-    
+
     if not HDF5_AVAILABLE:
         print("Error: h5py is required. Install with: pip install h5py hdf5plugin")
         sys.exit(1)
-    
+
     try:
-        inspect_hdf5_dataset(args.input_dir, args.num_steps)
+        inspect_hdf5_dataset(args.input_dir, args.num_steps, mode=args.mode)
     except Exception as e:
         print(f"\nError: {e}", file=sys.stderr)
         import traceback

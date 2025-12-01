@@ -5,44 +5,36 @@ import logging
 import math
 import os
 import random
+import sys
 import time
 import zlib
 from collections import deque
 from datetime import datetime
 from typing import Dict, List, Tuple
 
-import yaml
-import numpy as np
-
 import carla
-
-# Ensure repo root on sys.path so sibling packages resolve
-import sys
+import numpy as np
+import yaml
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from data.schema import (
-    K_ROUTE_POINTS,
-    N_FUTURE_STEPS,
-    FIXED_DELTA_SECONDS,
-    FUTURE_DELTA_SECONDS,
-    ACTOR_RADIUS_METERS,
-    WINDOW_METERS,
-)
+from carla_utils.actors import collect_nearby_actors, get_ego_state
+from carla_utils.bev import encode_bev_to_bytes, rasterize_bev
+from carla_utils.futures import FuturesBuffer, future_waypoints_ego
+from carla_utils.map_vectors import extract_lane_centerline_segments, extract_traffic_light_stoplines
+from carla_utils.rewards import RewardTracker, compute_reward, detect_offroad, detect_traffic_violation
+from carla_utils.route import distance_to_goal, map_cmd_and_route
 from data.hdf5_writer import HDF5EpisodeSetWriter
 from data.norms import normalize_ego_vector
-from carla_utils.route import map_cmd_and_route, distance_to_goal
-from carla_utils.actors import collect_nearby_actors, get_ego_state
-from carla_utils.map_vectors import extract_lane_centerline_segments, extract_traffic_light_stoplines
-from carla_utils.futures import FuturesBuffer, future_waypoints_ego
-from carla_utils.bev import rasterize_bev, encode_bev_to_bytes
-from carla_utils.rewards import (
-    RewardTracker,
-    compute_reward,
-    detect_offroad,
-    detect_traffic_violation,
+from data.schema import (
+    ACTOR_RADIUS_METERS,
+    FIXED_DELTA_SECONDS,
+    FUTURE_DELTA_SECONDS,
+    K_ROUTE_POINTS,
+    N_FUTURE_STEPS,
+    WINDOW_METERS,
 )
 
 
@@ -105,7 +97,7 @@ def write_meta(out_dir: str, meta: Dict) -> None:
 
 
 def build_hdf5_frame(rec: Dict, wp_future: List, vel_future: List, K: int, N: int, M: int) -> Dict:
-    """Build a frame dict for HDF5 output (matches BC collector shape)."""
+    """Pack a frame dict for HDF5 output."""
     from types import SimpleNamespace
 
     ego_row = SimpleNamespace(
@@ -285,6 +277,8 @@ def main():
         compression=compression,
         chunk_size=chunk_size,
         include_rewards=True,
+        include_actions=True,
+        include_terminals=True,
     )
     LOG.info("Using HDF5 backend (offline RL) with %d episodes per set", episodes_per_set)
 
@@ -513,6 +507,9 @@ def main():
                     "throttle": throttle,
                     "brake": brake,
                     "gear": gear,
+                    "action_steer": steer_norm,
+                    "action_throttle": throttle,
+                    "action_brake": brake,
                     "reward_raw": float(reward_out["raw"]),
                     "reward_clipped": float(reward_out["clipped"]),
                     "reward_normalized": float(reward_out["normalized"]),
@@ -525,6 +522,9 @@ def main():
                     "reward_mean": float(reward_out["stats"]["mean"] or 0.0),
                     "reward_std": float(reward_out["stats"]["std"] or 0.0),
                     "noise_injected": bool(noise_injected),
+                    "done": False,
+                    "discount": 1.0,
+                    "route_progress_delta": progress_delta,
                 }
 
                 if recording_ready:
@@ -552,10 +552,25 @@ def main():
                         LOG.info("  Terminating episode due to %s", termination_reason)
                     break
 
+            # After episode loop, capture extra horizon ticks to fill futures for tail frames
+            horizon_ticks = int(math.ceil(N * future_dt / max(fixed_dt, 1e-6)))
+            try:
+                for _ in range(horizon_ticks):
+                    world.tick()
+                    snapshot = world.get_snapshot()
+                    sim_time = float(getattr(getattr(snapshot, "timestamp", None), "elapsed_seconds", ep_frames * fixed_dt))
+                    speed_mps, _ = get_ego_state(ego)
+                    ego_tf = ego.get_transform()
+                    futures.add(sim_time, ego_tf, speed_mps)
+                    ep_frames += 1
+            except Exception as e:
+                LOG.warning("    Error capturing horizon ticks: %s (may lose tail frames)", e)
+
             # Flush pending frames
-            LOG.info("  Writing %d frames to disk...", len(pending))
+            LOG.info("  Processing %d pending frames for writing...", len(pending))
             frames_written = 0
             frames_skipped = 0
+            total_pending = len(pending)
             episode_frames = []
             while pending:
                 rec = pending.popleft()
@@ -565,30 +580,53 @@ def main():
                     frames_skipped += 1
                     continue
 
-                base_tf = rec["ego_tf"]
-                wp_future, vel_future = future_waypoints_ego(base_tf, samples)
-                frame_dict = build_hdf5_frame(rec, wp_future, vel_future, K, N, 64)
-                frame_dict.update(
-                    {
-                        "reward_raw": rec["reward_raw"],
-                        "reward_clipped": rec["reward_clipped"],
-                        "reward_normalized": rec["reward_normalized"],
-                        "reward_progress": rec["reward_progress"],
-                        "reward_collision": rec["reward_collision"],
-                        "reward_offroad": rec["reward_offroad"],
-                        "reward_violation": rec["reward_violation"],
-                        "reward_comfort": rec["reward_comfort"],
-                        "reward_completion": rec["reward_completion"],
-                        "reward_mean": rec["reward_mean"],
-                        "reward_std": rec["reward_std"],
-                        "noise_injected": rec["noise_injected"],
-                    }
-                )
-                episode_frames.append(frame_dict)
-                frames_written += 1
+                try:
+                    base_tf = rec["ego_tf"]
+                    wp_future, vel_future = future_waypoints_ego(base_tf, samples)
+                    frame_dict = build_hdf5_frame(rec, wp_future, vel_future, K, N, 64)
+                    frame_dict.update(
+                        {
+                            "reward_raw": rec["reward_raw"],
+                            "reward_clipped": rec["reward_clipped"],
+                            "reward_normalized": rec["reward_normalized"],
+                            "reward_progress": rec["reward_progress"],
+                            "reward_collision": rec["reward_collision"],
+                            "reward_offroad": rec["reward_offroad"],
+                            "reward_violation": rec["reward_violation"],
+                            "reward_comfort": rec["reward_comfort"],
+                            "reward_completion": rec["reward_completion"],
+                            "reward_mean": rec["reward_mean"],
+                            "reward_std": rec["reward_std"],
+                            "noise_injected": rec["noise_injected"],
+                        }
+                    )
+                    episode_frames.append(frame_dict)
+                    frames_written += 1
+
+                    # Progress logging
+                    if frames_written % 100 == 0:
+                        pct = (frames_written / total_pending) * 100 if total_pending > 0 else 0
+                        LOG.info("    Progress: %d/%d frames processed (%.1f%%)...", frames_written, total_pending, pct)
+                except Exception as e:
+                    LOG.error("    Error building frame for frame_id=%d: %s", rec.get("frame_id", -1), e)
+                    import traceback
+                    traceback.print_exc()
+                    raise
 
             if episode_frames:
-                hdf5_writer.append_episode(episode_frames)
+                episode_frames[-1]["done"] = True
+                episode_frames[-1]["discount"] = 0.0
+
+            if episode_frames:
+                try:
+                    LOG.info("    Writing %d frames to HDF5...", len(episode_frames))
+                    hdf5_writer.append_episode(episode_frames)
+                    LOG.info("    HDF5 write complete (%d frames)", len(episode_frames))
+                except Exception as e:
+                    LOG.error("    FATAL: HDF5 write failed: %s", e)
+                    import traceback
+                    traceback.print_exc()
+                    raise RuntimeError(f"Failed to write episode to HDF5: {e}") from e
 
             LOG.info(
                 "=== Episode %d/%d complete (%d frames written, %d skipped, termination=%s) ===",

@@ -2,46 +2,35 @@ host: "10.0.0.121"
 port: 2000
 tm_port: 8000
 
-# Output
-out_dir: "data/BC_v2"  # v2 uses HDF5+LZ4 format
+out_dir: "data/BC_v3"
 
-# Sim timing
-fixed_dt: 0.1          # 10 Hz
+fixed_dt: 0.1          
 future_dt: 0.2
 
-# Labels / tokens
-K: 32                  # route points ahead
-N: 12                   # future waypoints/vels
+K: 32                  
+N: 12                  
 
-# Extraction windows
 actor_radius: 40.0
 window_m: 60.0
 
-# Performance
-no_rendering: true
+no_rendering: false
 shard_rows: 1000
 max_frames: 550000
 
-# Defaults / fallbacks
-speed_limit_default_mps: 13.9   # use when map reports 0
-
-# Agent behavior
+speed_limit_default_mps: 13.9  
 behavior: "normal"
 wheelbase_m: 2.875
 
-# Episodes and traffic
-episodes: 10
+episodes: 1
 episode_max_frames: 2750
 npc_count: 40
 
-# Visual debug
-spectator_follow: false
+spectator_follow: true
 spectator_mode: "chase"
 
-# BEV configuration
 bev:
-  meters_x: 80.0         # forward/back extent (x)
-  meters_y: 60.0         # left/right extent (y)
+  meters_x: 80.0         
+  meters_y: 60.0         
   resolution_m: 0.4
   lane_width_m: 3.5
   route_corridor_width_m: 6.0
@@ -49,7 +38,6 @@ bev:
   drivable_thickness_m: 6.0
   actor_radius_m: 1.2
 
-# Validation thresholds
 validation:
   max_speed_mps: 50.0
   max_abs_accel_mps2: 12.0
@@ -58,11 +46,9 @@ validation:
   require_futures_per_frame: true
   require_objects_per_actor: true
 
-# Parquet storage
 parquet:
   compression: snappy
 
-# Storage backend
 storage:
   backend: hdf5
   episodes_per_set: 5

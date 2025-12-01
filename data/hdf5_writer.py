@@ -10,14 +10,9 @@ import numpy as np
 from typing import Dict, List, Optional
 from datetime import datetime
 
-try:
-    import h5py
-    import hdf5plugin  # For LZ4 compression
-    HDF5_AVAILABLE = True
-except ImportError:
-    HDF5_AVAILABLE = False
-    h5py = None
-    hdf5plugin = None
+import h5py
+import hdf5plugin
+HDF5_AVAILABLE = True
 
 
 class HDF5EpisodeSetWriter:
@@ -41,6 +36,9 @@ class HDF5EpisodeSetWriter:
         /future_mask: [N, N_fut] float32 - future validity mask
         /reward_*: [N] float32 - raw/clipped/normalized reward and components
         /noise_injected: [N] bool - whether control noise was applied
+        /action_*: [N] float32 - control signals (steer/throttle/brake) and progress delta
+        /done: [N] bool - terminal flags (optional)
+        /discount: [N] float32 - discount (1 for mid-episode, 0 at terminal)
     
     Attributes (metadata):
         K, N_future, C, H, W, version, norms_version, etc.
@@ -60,6 +58,8 @@ class HDF5EpisodeSetWriter:
         compression: str = "lz4",
         chunk_size: int = 100,
         include_rewards: bool = False,
+        include_actions: bool = False,
+        include_terminals: bool = False,
     ):
         """
         Args:
@@ -73,6 +73,8 @@ class HDF5EpisodeSetWriter:
             compression: Compression filter ("lz4", "lzf", "gzip", or None)
             chunk_size: Chunk size along sample dimension
             include_rewards: Whether to store reward/noise datasets (offline RL)
+            include_actions: Whether to store raw control signals
+            include_terminals: Whether to store done/discount flags
         """
         if not HDF5_AVAILABLE:
             raise ImportError("h5py and hdf5plugin are required for HDF5 writer")
@@ -100,6 +102,8 @@ class HDF5EpisodeSetWriter:
         self._current_size = 0  # Frames written into the current set
         self._episode_boundaries: List[int] = []  # cumulative frame offsets per episode
         self.include_rewards = bool(include_rewards)
+        self.include_actions = bool(include_actions)
+        self.include_terminals = bool(include_terminals)
     
     def _get_compression_filter(self, compression: str):
         """Get HDF5 compression filter."""
@@ -138,7 +142,8 @@ class HDF5EpisodeSetWriter:
         self._current_file.attrs["C"] = self.C
         self._current_file.attrs["H"] = self.H
         self._current_file.attrs["W"] = self.W
-        self._current_file.attrs["version"] = "2.1" if self.include_rewards else "2.0"
+        has_rl_fields = self.include_rewards or self.include_actions or self.include_terminals
+        self._current_file.attrs["version"] = "2.2" if has_rl_fields else "2.0"
         self._current_file.attrs["norms_version"] = 1
         if self.include_rewards:
             self._current_file.attrs["reward_stats_version"] = 1
@@ -256,6 +261,38 @@ class HDF5EpisodeSetWriter:
                 chunks=(chunk_n,),
                 compression=self.compression,
             )
+        if self.include_actions:
+            for name in [
+                "action_steer",
+                "action_throttle",
+                "action_brake",
+                "route_progress_delta",
+            ]:
+                self._current_file.create_dataset(
+                    name,
+                    shape=(0,),
+                    maxshape=(None,),
+                    dtype=np.float32,
+                    chunks=(chunk_n,),
+                    compression=self.compression,
+                )
+        if self.include_terminals:
+            self._current_file.create_dataset(
+                "done",
+                shape=(0,),
+                maxshape=(None,),
+                dtype=np.bool_,
+                chunks=(chunk_n,),
+                compression=self.compression,
+            )
+            self._current_file.create_dataset(
+                "discount",
+                shape=(0,),
+                maxshape=(None,),
+                dtype=np.float32,
+                chunks=(chunk_n,),
+                compression=self.compression,
+            )
 
         return filepath
     
@@ -317,6 +354,14 @@ class HDF5EpisodeSetWriter:
                 f["reward_mean"].resize((end,))
                 f["reward_std"].resize((end,))
                 f["noise_injected"].resize((end,))
+            if self.include_actions:
+                f["action_steer"].resize((end,))
+                f["action_throttle"].resize((end,))
+                f["action_brake"].resize((end,))
+                f["route_progress_delta"].resize((end,))
+            if self.include_terminals:
+                f["done"].resize((end,))
+                f["discount"].resize((end,))
 
             # Materialize numpy batches and write
             f["frame_id"][start:end] = np.array([fr["frame_id"] for fr in batch], dtype=np.int64)
@@ -363,6 +408,26 @@ class HDF5EpisodeSetWriter:
                 f["noise_injected"][start:end] = np.array(
                     [bool(fr.get("noise_injected", False)) for fr in batch], dtype=np.bool_
                 )
+            if self.include_actions:
+                f["action_steer"][start:end] = np.array(
+                    [float(fr.get("action_steer", 0.0)) for fr in batch], dtype=np.float32
+                )
+                f["action_throttle"][start:end] = np.array(
+                    [float(fr.get("action_throttle", 0.0)) for fr in batch], dtype=np.float32
+                )
+                f["action_brake"][start:end] = np.array(
+                    [float(fr.get("action_brake", 0.0)) for fr in batch], dtype=np.float32
+                )
+                f["route_progress_delta"][start:end] = np.array(
+                    [float(fr.get("route_progress_delta", 0.0)) for fr in batch], dtype=np.float32
+                )
+            if self.include_terminals:
+                f["done"][start:end] = np.array(
+                    [bool(fr.get("done", False)) for fr in batch], dtype=np.bool_
+                )
+                f["discount"][start:end] = np.array(
+                    [float(fr.get("discount", 1.0)) for fr in batch], dtype=np.float32
+                )
 
             self._current_size = end
             idx += b
@@ -396,4 +461,3 @@ class HDF5EpisodeSetWriter:
         # Finalize partial set if open
         if self._current_file is not None:
             self._finalize_current_file()
-

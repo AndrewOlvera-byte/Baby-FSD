@@ -1,24 +1,21 @@
-# Reusable base settings (DRY via anchors)
 x-trainer-common: &trainer-common
   build:
     context: ../..
     dockerfile: pipeline/docker/Dockerfile
     args:
-      BASE_IMAGE: ${BASE_IMAGE-}   # optional override at build time
+      BASE_IMAGE: ${BASE_IMAGE-}
   image: rlds-trainer:latest
   working_dir: /app
-  # Enable GPU in local docker compose (not swarm)
   gpus: all
   deploy:
     resources:
       reservations:
         devices:
           - capabilities: ["gpu"]
-  # local Docker (not Swarm) can also use: gpus: all
   volumes:
     - ../../:/app
     - ../../pipeline/outputs:/app/pipeline/outputs
-  shm_size: 8gb            # Large shared memory for PyTorch multiprocessing with YOLO
+  shm_size: 8gb            
   environment:
     - PYTHONPATH=/app:/app/pipeline
     - MUJOCO_GL=egl
@@ -27,10 +24,8 @@ x-trainer-common: &trainer-common
 
 services:
 
-  # TRAIN service (default)
   trainer:
     <<: *trainer-common
-    # Default runs your selected exp from config/defaults.yaml
     command: ["python", "pipeline/scripts/train.py"]
 
   search:

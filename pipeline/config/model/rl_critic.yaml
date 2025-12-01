@@ -1,0 +1,20 @@
+name: rl_critic
+
+# Ego state dimension (14 features: speed, yaw_rate, accel_long, accel_lat, curvature, steer_angle, steer_norm, throttle, brake, speed_limit, command, gear, time_of_day_sin, time_of_day_cos)
+ego_dim: 14
+
+# BEV encoder
+bev_channels: 18
+bev_patch_size: 16
+bev_depth: 4
+bev_heads: 8
+
+# Transformer dimensions
+d_model: 256
+nhead: 8
+num_encoder_layers: 6
+dim_feedforward: 1024
+dropout: 0.1
+
+# Action dimensions
+action_dim: 3
