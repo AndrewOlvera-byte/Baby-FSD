@@ -315,7 +315,13 @@ def main():
     bev_res = float(bev_cfg.get("resolution_m", 0.25))
 
     # Default speed limit (m/s) if the map reports 0
-    speed_limit_default_mps = float(cfg.get("speed_limit_default_mps", 13.9))  # ~50 km/h
+    speed_limit_default_mps = float(cfg.get("speed_limit_default_mps", 50.0))  # force high default by default
+    force_speed_limit_mps = cfg.get("force_speed_limit_mps", None)
+    if force_speed_limit_mps is not None:
+        try:
+            force_speed_limit_mps = float(force_speed_limit_mps)
+        except Exception:
+            force_speed_limit_mps = None
 
     # Futures buffer must hold the whole episode so early frames keep their horizon
     horizon_ticks = int(math.ceil(N * future_dt / max(fixed_dt, 1e-6)))
@@ -622,6 +628,8 @@ def main():
                 speed_limit_mps = float(getattr(wp, "speed_limit", 0.0) or 0.0)
                 if speed_limit_mps > 30.0:
                     speed_limit_mps = speed_limit_mps / 3.6
+                if force_speed_limit_mps is not None:
+                    speed_limit_mps = force_speed_limit_mps
                 elif speed_limit_mps <= 0.0:
                     speed_limit_mps = speed_limit_default_mps
                     ep_stats["speed_limit_fallback"] += 1
@@ -638,6 +646,10 @@ def main():
                 map_polys = extract_lane_centerline_segments(world.get_map(), ego_tf, window_m=window_m, step_m=2.0)
                 tls = extract_traffic_light_stoplines(world, ego_tf, window_m=window_m)
                 bev_tensor, bev_meta = rasterize_bev(route_xy, map_polys, tls, actors, bev_cfg)
+                # Ensure speed-limit channel is populated (use forced/default limit if map is missing)
+                speed_limit_fill = force_speed_limit_mps if force_speed_limit_mps is not None else speed_limit_mps
+                if bev_tensor.shape[0] >= 18:
+                    bev_tensor[17] = float(speed_limit_fill)
                 bev_bytes = encode_bev_to_bytes(bev_tensor)
 
                 # Store frame data after all features are computed

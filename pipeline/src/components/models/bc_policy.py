@@ -344,23 +344,19 @@ class BCPolicy(nn.Module):
         print(f"  Total parameters: {n_params:,} ({n_params/1e6:.2f}M)")
     
     def _init_weights(self):
-        """Initialize weights with transformer-appropriate scaling for stable training."""
+        """
+        Use PyTorch defaults for Transformer layers (keeps healthy variance)
+        and only specialize embeddings/conv where helpful.
+        """
         for module in self.modules():
-            if isinstance(module, nn.Linear):
-                # Use smaller gain for transformer layers (better stability)
-                nn.init.xavier_uniform_(module.weight, gain=0.02)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Conv2d):
-                # Conv layers (BEV patch embedding)
+            if isinstance(module, nn.Conv2d):
                 nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Embedding):
-                # Embedding layers (object types)
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
         
-        # Initialize learnable parameters (queries, modality embeddings)
+        # Learnable parameters (queries, modality embeddings)
         if hasattr(self, 'future_queries'):
             nn.init.normal_(self.future_queries, mean=0.0, std=0.02)
         if hasattr(self, 'modality_embed'):

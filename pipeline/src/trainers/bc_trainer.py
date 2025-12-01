@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader
 from src.core.trainer_base import BaseTrainer
 from src.core.registry import register, get
 from tqdm import tqdm
+from data.norms import SPATIAL_MAX, V_MAX
 
 # Add project root to path for data module imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../../"))
@@ -200,13 +201,18 @@ class BCTrainer(BaseTrainer):
 
         self.gpu_augmentation = None
         if aug_cfg is not None and bool(getattr(aug_cfg, "enabled", False)):
+            enable_rotation = bool(getattr(aug_cfg, "enable_rotation", False))
             self.gpu_augmentation = GPUBatchAugmentation(
-                p_rot=float(getattr(aug_cfg, "p_rot", 0.5)),
+                p_rot=float(getattr(aug_cfg, "p_rot", 0.0)),
+                enable_rotation=enable_rotation,
                 max_rot_deg=float(getattr(aug_cfg, "max_rot_deg", 20.0)),
                 p_bev_cutout=float(getattr(aug_cfg, "p_bev_cutout", 0.2)),
                 p_bev_channel_drop=float(getattr(aug_cfg, "p_bev_channel_drop", 0.1)),
             ).to(self.device)
-            print(f"[BCTrainer] GPU augmentation enabled: rotation, cutout, channel drop")
+            if enable_rotation and self.gpu_augmentation.p_rot > 0.0:
+                print(f"[BCTrainer] GPU augmentation enabled: rotation ON, cutout, channel drop")
+            else:
+                print(f"[BCTrainer] GPU augmentation enabled: rotation OFF, cutout, channel drop")
     
     def _update_ema(self):
         """Update EMA model parameters."""
@@ -358,13 +364,18 @@ class BCTrainer(BaseTrainer):
         else:
             weights = torch.ones_like(future_mask)
         
-        # Losses
-        waypoint_loss = (pred_xy - gt_xy).pow(2).sum(dim=-1)  # (B, N)
-        waypoint_loss = (waypoint_loss * future_mask * weights).sum() / ((future_mask * weights).sum() + 1e-8)
+        valid_weights = future_mask * weights
+        if torch.sum(valid_weights) <= 0:
+            raise ValueError("future_mask has no valid entries; cannot compute loss.")
         
-        # Huber loss for speeds to reduce outlier impact
-        speed_loss_raw = F.smooth_l1_loss(pred_v, gt_v, reduction="none")  # (B, N)
-        speed_loss = (speed_loss_raw * future_mask * weights).sum() / ((future_mask * weights).sum() + 1e-8)
+        # Compute loss in physical units (meters, m/s) for healthy gradients
+        waypoint_diff_m = (pred_xy - gt_xy) * SPATIAL_MAX  # (B, N, 2)
+        waypoint_loss = waypoint_diff_m.pow(2).sum(dim=-1)  # (B, N)
+        waypoint_loss = (waypoint_loss * valid_weights).sum() / (valid_weights.sum() + 1e-8)
+        
+        # Huber loss on speeds in m/s
+        speed_loss_raw = F.smooth_l1_loss(pred_v * V_MAX, gt_v * V_MAX, reduction="none")  # (B, N)
+        speed_loss = (speed_loss_raw * valid_weights).sum() / (valid_weights.sum() + 1e-8)
         
         # Combined loss
         total_loss = (
@@ -464,6 +475,18 @@ class BCTrainer(BaseTrainer):
                     epoch_batch_count += 1
 
                     batch = self.to_device(batch)
+
+                    # Fail fast on obviously degenerate data (first batch only)
+                    if epoch == 1 and batch_idx == 1:
+                        fut_v_mps = batch["future_v"] * V_MAX
+                        fut_xy_m = batch["future_xy"] * SPATIAL_MAX
+                        speed_std = float(fut_v_mps.std().item())
+                        xy_std = float(fut_xy_m.std().item())
+                        if speed_std < 0.1:
+                            raise ValueError(f"[BCTrainer] future_v std too low ({speed_std:.3f} m/s). Check data normalization/collection.")
+                        if xy_std < 0.5:
+                            raise ValueError(f"[BCTrainer] future_xy std too low ({xy_std:.3f} m). Check data normalization/collection.")
+                        print(f"[BCTrainer] Data sanity (first batch): future_v std={speed_std:.3f} m/s, future_xy std={xy_std:.3f} m")
 
                     # Apply GPU augmentations (heavy ops: rotation, cutout)
                     if self.gpu_augmentation is not None:

@@ -73,6 +73,10 @@ def read_hdf5_sample(f: h5py.File, idx: int, fields: List[str]) -> Dict[str, np.
             sample[key] = np.array(arr, dtype=np.bool_)
         else:
             sample[key] = np.array(arr, dtype=np.float32)
+        
+        # Basic integrity check: forbid NaN/inf to avoid corrupt shards
+        if not np.isfinite(sample[key]).all():
+            raise ValueError(f"Non-finite values found in field '{key}' at index {idx}")
 
     return sample
 

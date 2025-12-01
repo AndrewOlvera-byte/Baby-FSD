@@ -25,7 +25,8 @@ class GPUBatchAugmentation(nn.Module):
 
     def __init__(
         self,
-        p_rot: float = 0.5,
+        p_rot: float = 0.0,
+        enable_rotation: bool = False,
         max_rot_deg: float = 20.0,
         p_bev_cutout: float = 0.2,
         cutout_size_range: tuple = (10, 30),
@@ -41,6 +42,7 @@ class GPUBatchAugmentation(nn.Module):
         """
         super().__init__()
         self.p_rot = p_rot
+        self.enable_rotation = enable_rotation
         self.max_rot_deg = max_rot_deg
         self.p_bev_cutout = p_bev_cutout
         self.cutout_size_range = cutout_size_range
@@ -63,7 +65,7 @@ class GPUBatchAugmentation(nn.Module):
         device = batch["bev"].device
 
         # 1. Random rotation (per-sample)
-        if self.p_rot > 0.0:
+        if self.enable_rotation and self.p_rot > 0.0:
             # Generate random angles for batch
             angles = torch.zeros(B, device=device)
             rot_mask = torch.rand(B, device=device) < self.p_rot

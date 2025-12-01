@@ -43,6 +43,7 @@ trainer:
     weight_decay: 0.1      # Strong regularization (was 0.05)
     betas: [0.9, 0.95]
     eps: 1.0e-8
+    fused: true            # use fused AdamW when available on CUDA
 
   lr_scheduler:
     name: cosine
@@ -83,8 +84,9 @@ model:
 augmentation:
   enabled: true
   # GPU augmentations (heavy ops)
-  p_rot: 0.7               # Increased from 0.5
-  max_rot_deg: 20.0        # Increased from 15.0
+  enable_rotation: false   # keep off to avoid ego/scene mismatch for now
+  p_rot: 0.0               # explicit off
+  max_rot_deg: 20.0        # retained for future use
   p_bev_cutout: 0.3        # Increased from 0.25
   p_bev_channel_drop: 0.2  # Increased from 0.15
   # CPU augmentations (lightweight ops)

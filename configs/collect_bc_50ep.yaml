@@ -18,6 +18,7 @@ shard_rows: 1000
 max_frames: 550000
 
 speed_limit_default_mps: 13.9   
+force_speed_limit_mps: 50.0
 
 behavior: "normal"     
 wheelbase_m: 2.875
@@ -57,9 +58,9 @@ storage:
   chunk_size: 100
 
 stopping:
-  keep_stationary_ratio: 0.15    
+  keep_stationary_ratio: 0.6     
   min_speed_mps: 0.3
-  max_consecutive_stationary: 5
+  max_consecutive_stationary: 30
   keep_near_traffic_light: true
   traffic_light_radius_m: 15.0
 

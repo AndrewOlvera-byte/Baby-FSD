@@ -317,6 +317,19 @@ def inspect_hdf5_dataset(input_dir: str, num_steps: int = 100, mode: str = "bc")
     objects = torch.stack([s["objects"] for s in normalized_samples])
     future_xys = torch.stack([s["future_xy"] for s in normalized_samples])
     future_vs = torch.stack([s["future_v"] for s in normalized_samples])
+
+    # Fail-fast sanity checks mirroring trainer safeguards (physical units)
+    future_v_mps = future_vs * 50.0  # V_MAX
+    future_xy_m = future_xys * 100.0  # SPATIAL_MAX
+    speed_std = float(future_v_mps.std().item())
+    xy_std = float(future_xy_m.std().item())
+    if speed_std < 0.1:
+        print("\n[ERROR] future_v std too low "
+              f"({speed_std:.3f} m/s). Data likely degenerate or mis-normalized.")
+    if xy_std < 0.5:
+        print("\n[ERROR] future_xy std too low "
+              f"({xy_std:.3f} m). Data likely degenerate or mis-normalized.")
+    print(f"\n[Sanity] future_v std={speed_std:.3f} m/s, future_xy std={xy_std:.3f} m")
     
     print_statistics("ego_vec", ego_vecs)
     print()

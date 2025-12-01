@@ -8,6 +8,7 @@ class AdamWFactory:
         model = context["model"]
         lr = float(cfg_node.lr)
         weight_decay = float(cfg_node.weight_decay)
+        fused = bool(getattr(cfg_node, "fused", False))
         
         # Support custom betas for transformer training
         # Default betas=[0.9, 0.999], but transformers often benefit from lower beta2
@@ -20,11 +21,14 @@ class AdamWFactory:
         # Support custom eps
         eps = float(getattr(cfg_node, "eps", 1e-8))
         
-        opt = torch.optim.AdamW(
-            model.parameters(), 
-            lr=lr, 
+        opt_kwargs = dict(
+            lr=lr,
             weight_decay=weight_decay,
             betas=betas,
-            eps=eps
+            eps=eps,
         )
+        # fused AdamW only on CUDA builds that support it
+        if fused and torch.cuda.is_available():
+            opt_kwargs["fused"] = True
+        opt = torch.optim.AdamW(model.parameters(), **opt_kwargs)
         return opt
