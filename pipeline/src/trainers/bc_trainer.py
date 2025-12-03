@@ -593,9 +593,11 @@ class BCTrainer(BaseTrainer):
                         # Set the scheduler to be at the current step
                         # After epoch 1, global_step = actual_steps_per_epoch
                         # We want scheduler to resume from there
-                        scheduler.last_epoch = global_step - 1
-                        # Call step() once to update LR to the correct value for current step
-                        scheduler.step()
+                        scheduler.last_epoch = global_step
+                        # Manually update LR without calling step() to avoid warning
+                        # The scheduler will compute the correct LR based on last_epoch
+                        for param_group in self.optimizer.param_groups:
+                            param_group['lr'] = scheduler.get_last_lr()[0] if hasattr(scheduler, 'get_last_lr') else scheduler.get_lr()[0]
                         print(f"[BCTrainer] Scheduler initialized at step {global_step}, LR={self.optimizer.param_groups[0]['lr']:.2e}")
 
                 if pbar_inner is not None:

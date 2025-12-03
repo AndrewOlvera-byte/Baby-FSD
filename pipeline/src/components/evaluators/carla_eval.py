@@ -693,8 +693,6 @@ class CarlaEvaluator:
             "future_v": future_v,
             "future_mask": future_mask,
         }
-        
-        return metrics
     
     def _connect_carla(self):
         """Connect to CARLA server (TODO)."""

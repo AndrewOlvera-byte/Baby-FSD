@@ -8,6 +8,7 @@ optimizer:
   weight_decay: 0.01
   betas: [0.9, 0.95]
   eps: 1.0e-8
+  fused: false  # Enable fused AdamW for better performance (PyTorch >= 2.0)
 
 lr_scheduler:
   name: cosine

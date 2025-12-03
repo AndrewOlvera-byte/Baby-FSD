@@ -22,7 +22,7 @@ behavior: "normal"
 wheelbase_m: 2.875
 
 episodes: 1
-episode_max_frames: 2750
+episode_max_frames: 100
 npc_count: 40
 
 spectator_follow: true
