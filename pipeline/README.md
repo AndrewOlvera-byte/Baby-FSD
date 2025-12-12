@@ -1,4 +1,6 @@
-# Pipeline V4 Usage
+# Pipeline Usage
+
+Training pipeline for Behavior Cloning and Offline RL models.
 
 ## Prerequisites
 - Docker with NVIDIA GPU support (Linux: nvidia-container-toolkit; Windows: WSL2 + Docker Desktop + GPU enabled).
@@ -20,49 +22,58 @@ Outputs go to `outputs/${exp.name}/${modes.mode}/${now:%Y%m%d_%H%M%S}/reports/` 
 
 ### Local (Host)
 ```bash
-# Default YOLO segmentation training (full run)
+# Default BC training (default experiment)
 python -m scripts.train
 
-# Quick YOLO debug pass (1 epoch)
-python -m scripts.train exp=yolo_seg_debug
+# BC with custom dataset path
+python -m scripts.train exp=bc_train dataset.run_dir=data/BC_v3/run-YYYYMMDD-HHMMSS-wds
 
-# Explicit full-run selection (same as default)
-python -m scripts.train exp=yolo_seg_train
+# Offline RL training (IQL by default)
+python -m scripts.train exp=offline_rl_train dataset.run_dir=data/RL_v1/run-YYYYMMDD-HHMMSS-wds
 ```
 
 ### Container (Recommended for GPU/Isolation)
 From project root:
 ```bash
 cd docker
-docker-compose up -d trainer  # Runs python scripts/train.py (default exp)
+docker-compose up -d trainer  # Runs python scripts/train.py (default: bc_train)
 ```
 Override exp:
 ```bash
 cd docker
 
-# YOLO segmentation (debug)
-docker-compose run --rm trainer python -m scripts.train exp=yolo_seg_debug
+# BC training
+docker-compose run --rm trainer python -m scripts.train exp=bc_train
 
-# YOLO segmentation (full run)
-docker-compose run --rm trainer python -m scripts.train exp=yolo_seg_train
+# Offline RL training
+docker-compose run --rm trainer python -m scripts.train exp=offline_rl_train
 ```
+
+## Available Experiments
+
+| Experiment | Description |
+|------------|-------------|
+| `bc_train` | Behavior Cloning (default) |
+| `bc_train_small` | BC with smaller batch/epochs for debugging |
+| `bc_train_70k` | BC tuned for ~70k samples |
+| `offline_rl_train` | Offline RL with IQL/CQL/TD3+BC |
 
 ## Evaluate
 ```bash
-# Local
-python -m scripts.eval exp=cifar10_eval
+# Local - evaluate trained BC model in CARLA
+python -m scripts.eval exp=bc_train
 
 # Container
-cd docker && docker-compose run --rm eval  # Runs python scripts/eval.py
+cd docker && docker-compose run --rm eval
 ```
 
 ## Hyperparameter Search (Optuna)
 ```bash
 # Local multirun
-python -m scripts.search -m +hpo=optuna +hpo_space=space_sl_basic exp=cifar10_train hydra.sweeper.n_trials=50
+python -m scripts.search -m +hpo=optuna exp=bc_train hydra.sweeper.n_trials=50
 
 # Container
-cd docker && docker-compose run --rm search  # Example: +hpo=optuna +hpo_space=space_sl_basic
+cd docker && docker-compose run --rm search
 ```
 Results in per-trial run dirs with topk.json summary.
 
@@ -71,52 +82,17 @@ GPU-enabled shell with mounted source:
 ```bash
 cd docker && docker-compose run --rm trainer bash
 ```
-Inside: `python -m scripts.train exp=quick_debug_sl` or `pytest`.
+Inside: `python -m scripts.train exp=bc_train` or `pytest`.
 
 ## Monitor Logs
 - Local: Watch terminal (progress bars + metrics).
 - Container: `docker-compose logs -f trainer` (from docker dir).
 
-## YOLO Segmentation Training
-The pipeline supports YOLOv11 segmentation training with a self-contained wrapper:
-
-### Features
-- Self-sufficient trainer (no registry dependencies)
-- Wrapper around ultralytics YOLO.train()
-- Built-in progress tracking and metrics visualization
-- Automatic training history plots (loss/mAP over epochs)
-- Optimized for high-resolution images (1920x1080 → 2048px)
-
-### Dataset Setup
-Place your YOLO dataset in `data/yolo_dataset_v1/` with structure:
-```
-data/yolo_dataset_v1/
-  ├── data.yaml          # YOLO data config
-  ├── images/
-  │   ├── train/         # Training images
-  │   └── val/           # Validation images
-  └── labels/
-      ├── train/         # Training labels (.txt)
-      └── val/           # Validation labels (.txt)
-```
-
-### Configurations
-- `yolo_seg_debug`: lightweight smoke test (1 epoch, batch=4, imgsz=1280)
-- `yolo_seg_train`: full run (100 epochs, batch=12, imgsz=2048, tuned for 16GB VRAM)
-- Tweak hyperparameters directly in `src/trainers/yolo_seg_configs/debug.yaml` or `src/trainers/yolo_seg_configs/train.yaml` (no Hydra edits required)
-
-### Outputs
-Training outputs saved to `outputs/${exp.name}/${modes.mode}/${timestamp}/`:
-- `reports/training_history.png`: Loss and mAP plots
-- `yolo_train/`: YOLO native outputs (weights, results.csv, plots)
-- `reports/metrics.jsonl`: Training logs
-
 ## Troubleshooting
 - GPU not available? Run `docker-compose run --rm trainer nvidia-smi` to check.
 - Interpolation errors? Ensure Hydra overrides are correct (e.g., `exp=...`).
-- Data missing? CIFAR-10 downloads to `./data` on first run (no copying to outputs).
-- YOLO dataset not found? Check `data/yolo_dataset_v1/data.yaml` exists and has correct paths.
-- OOM errors? Reduce batch_size in experiment config or use smaller imgsz.
+- Dataset not found? Check your `dataset.run_dir` path points to a valid WebDataset directory.
+- OOM errors? Reduce `trainer.batch_size` in experiment config.
 - Rebuild if deps change: `docker compose build --no-cache`.
 
-For custom exps, edit `config/exp/*.yaml` and rerun.
+For custom experiments, edit `config/exp/*.yaml` and rerun.

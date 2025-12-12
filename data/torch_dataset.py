@@ -1,7 +1,5 @@
 """
-Optimized for high-throughput training using WebLoader pattern:
-- Workers yield individual samples
-- WebLoader collects from all workers and rebatches in main process
+REFACTOR TO /data/lib/utils FOR EXTENSIBILITY
 """
 
 import os
@@ -791,8 +789,8 @@ def create_rl_dataloader(
     """
     start_time = time.time()
 
-    # Create dataset that yields INDIVIDUAL samples (no batching)
-    # Note: Uses BCWebDataset which should work with RL data (same base fields + optional RL fields)
+    # Create dataset that yields INDIVIDUAL samples
+    # Note: Uses BCWebDataset which should work with RL data
     dataset = BCWebDataset(
         run_dir=run_dir,
         future_horizon=future_horizon,
@@ -803,7 +801,7 @@ def create_rl_dataloader(
         split=split,
         val_ratio=val_ratio,
         shuffle_buffer_size=shuffle_buffer_size,
-        augment_config=None,  # RL typically doesn't use CPU augmentation
+        augment_config=None, 
     )
 
     init_time = time.time() - start_time

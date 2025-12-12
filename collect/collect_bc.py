@@ -1,3 +1,6 @@
+""" 
+REFACTOR TO /collect/lib/utils FOR  FUTURE EXTENSIBILITY
+"""
 import argparse
 import glob
 import io
@@ -20,7 +23,6 @@ import sys
 
 import carla
 
-# Ensure repo root on sys.path so sibling packages (data, carla_utils) resolve
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)

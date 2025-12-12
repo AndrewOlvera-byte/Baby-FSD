@@ -1,7 +1,7 @@
 name: carla_eval
 
 # CARLA server connection (debug-friendly)
-host: "10.0.0.121"
+host: ""
 port: 2000
 tm_port: 8000
 
